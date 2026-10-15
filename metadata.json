@@ -1,0 +1,6 @@
+{
+  "name": "SamEduHub Sign In",
+  "description": "SamEduHub authentication portal featuring the current layout, styling, and interactive workflow.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
