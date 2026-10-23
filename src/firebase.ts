@@ -1,5 +1,5 @@
 import { initializeApp, getApps, getApp, type FirebaseApp } from 'firebase/app';
-import { browserLocalPersistence, getAuth, initializeAuth, type Auth } from 'firebase/auth';
+import { browserLocalPersistence, browserSessionPersistence, getAuth, initializeAuth, type Auth } from 'firebase/auth';
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -25,7 +25,9 @@ if (isFirebaseConfigured) {
   try {
     app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
     try {
-      auth = initializeAuth(app, { persistence: browserLocalPersistence });
+      // Register both browser stores so Firebase can restore a session regardless
+      // of whether the user selected "Remember me" before their last sign-in.
+      auth = initializeAuth(app, { persistence: [browserLocalPersistence, browserSessionPersistence] });
     } catch (error) {
       // HMR or another Firebase module may already have initialized Auth for this app.
       if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'auth/already-initialized') {

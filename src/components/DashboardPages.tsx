@@ -432,10 +432,10 @@ function WalletPage({ onNavigate }: DashboardPageProps) {
     setSubmitting(true);
     try {
       const funding = await createWalletFunding(amount);
-      setFundingRef(funding.txRef);
       if (!funding.checkoutUrl) throw new Error('Paystack did not return a checkout URL.');
-      const checkoutWindow = window.open(funding.checkoutUrl, '_blank', 'noopener,noreferrer');
-      setStatus({ type: 'info', title: checkoutWindow ? 'Paystack checkout opened' : 'Allow the checkout window', message: checkoutWindow ? `Complete payment for ${funding.txRef}. This page will verify the payment and update your wallet automatically.` : 'Your browser blocked the checkout window. Allow pop-ups for this site and try again.' });
+      // Keep the same tab so Firebase session persistence survives the payment
+      // provider round-trip and the callback can reopen the wallet dashboard.
+      window.location.assign(funding.checkoutUrl);
     } catch (submitError) {
       setStatus({ type: 'error', title: 'Funding could not start', message: submitError instanceof Error ? submitError.message : 'The wallet funding request could not be started.' });
     } finally { setSubmitting(false); }
