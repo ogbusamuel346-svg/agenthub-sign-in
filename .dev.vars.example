@@ -1,0 +1,17 @@
+# Copy this file to .dev.vars for local Wrangler development.
+# Do not put CLOUDFLARE_API_TOKEN here; Wrangler CLI authentication uses `wrangler login`.
+FIREBASE_PROJECT_ID="YOUR_FIREBASE_PROJECT_ID"
+
+# Required only when using Cloudflare-backed wallet funding or TopupMate catalogues.
+FLW_SECRET_KEY=""
+FLW_SECRET_HASH=""
+TOPUPMATE_API_BASE_URL="https://connect.topupmate.com/api/"
+TOPUPMATE_API_TOKEN=""
+TOPUPMATE_REQUEST_TIMEOUT_MS="15000"
+TOPUPMATE_ADMIN_VIEW_TOKEN=""
+
+# Leave false until every wallet operation has been switched and reconciled.
+CLOUDFLARE_WALLET_CUTOVER="false"
+
+# Optional return-to-app URL after Flutterwave payment.
+FLW_FRONTEND_RETURN_URL=""

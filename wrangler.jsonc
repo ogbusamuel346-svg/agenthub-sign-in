@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sameduhub-api",
+  "main": "cloudflare/worker.ts",
+  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_date": "2026-10-22",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "vars": {
+    "CLOUDFLARE_WALLET_CUTOVER": "false",
+    "CLOUDFLARE_FUNDING_ENABLED": "false",
+    "TOPUPMATE_PURCHASES_ENABLED": "false"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "sameduhub",
+      "database_id": "d6268652-e768-4f07-bf1b-440f795697e1",
+      "migrations_dir": "migrations",
+      "migrations_table": "schema_migrations"
+    }
+  ]
+}

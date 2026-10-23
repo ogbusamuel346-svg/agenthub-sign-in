@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sameduhub-api-preview",
+  "main": "cloudflare/worker.ts",
+  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_date": "2026-10-22",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "vars": {
+    "CLOUDFLARE_WALLET_CUTOVER": "true",
+    "CLOUDFLARE_FUNDING_ENABLED": "true",
+    // Flutterwave can be tested with sandbox credentials; TopupMate currently
+    // targets its live API, so keep supplier purchases disabled until funded.
+    "TOPUPMATE_PURCHASES_ENABLED": "false"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "sameduhub-preview",
+      "database_id": "33a422a4-6583-4aa4-aeff-78525ddbcf63",
+      "migrations_dir": "migrations",
+      "migrations_table": "schema_migrations"
+    }
+  ]
+}

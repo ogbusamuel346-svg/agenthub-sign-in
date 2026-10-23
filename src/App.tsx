@@ -7,20 +7,41 @@ import {
   AlertTriangle,
   X,
   ArrowLeft,
-  Wallet,
   Smartphone,
   Shield,
-  CreditCard,
-  FileText,
-  Tv,
-  LogOut,
-  RefreshCw,
-  ExternalLink,
   Zap,
-  Layers,
-  Sparkles
+  Sparkles,
+  Database,
+  Key,
+  Home,
+  Mail,
+  LockKeyhole,
+  UserRound,
+  Phone
 } from 'lucide-react';
-import { VtuAnimation } from './components/VtuAnimation';
+import { UserDashboard } from './components/UserDashboard';
+import { LandingPage } from './components/LandingPage';
+import {
+  AuthBrand,
+  AuthDivider,
+  AuthField,
+  AuthSubmitButton,
+  AuthTerms,
+  GoogleAuthButton,
+} from './components/AuthUI';
+import { auth, isFirebaseConfigured, firebaseConfig, firebaseInitializationErrorCode } from './firebase';
+import {
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  sendPasswordResetEmail,
+  sendEmailVerification,
+  updateProfile,
+  setPersistence,
+  browserLocalPersistence,
+  browserSessionPersistence,
+  signOut,
+  onAuthStateChanged,
+} from 'firebase/auth';
 
 interface ToastData {
   id: string;
@@ -30,8 +51,38 @@ interface ToastData {
   position?: 'topRight' | 'center';
 }
 
+class DashboardErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { hasError: boolean; errorMessage: string }
+> {
+  state = { hasError: false, errorMessage: '' };
+
+  static getDerivedStateFromError(error: unknown) {
+    return { hasError: true, errorMessage: error instanceof Error ? error.message : 'Unknown render error' };
+  }
+
+  componentDidCatch(error: unknown) {
+    console.error('Dashboard render error:', error);
+  }
+
+  render() {
+    if (!this.state.hasError) return this.props.children;
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-[#f4f8ff] px-5 py-12">
+        <div className="w-full max-w-md rounded-2xl border border-rose-200 bg-white p-7 text-center shadow-xl">
+          <AlertTriangle className="mx-auto h-10 w-10 text-rose-500" />
+          <h1 className="mt-4 text-xl font-extrabold text-[#0c3275]">Dashboard could not be displayed</h1>
+          <p className="mt-2 text-sm leading-relaxed text-[#587098]">A dashboard component encountered an error. Your account is still signed in; reload the page to try again.</p>
+          {this.state.errorMessage && <p className="mt-3 break-words rounded-lg bg-rose-50 px-3 py-2 text-left text-xs text-rose-700">Diagnostic: {this.state.errorMessage}</p>}
+          <button type="button" onClick={() => window.location.reload()} className="mt-5 rounded-lg bg-[#155EEF] px-5 py-3 text-sm font-extrabold text-white hover:bg-[#0e4dcc]">Reload dashboard</button>
+        </div>
+      </div>
+    );
+  }
+}
+
 export default function App() {
-  const [view, setView] = useState<'signin' | 'forgot' | 'signup' | 'dashboard'>('signin');
+  const [view, setView] = useState<'landing' | 'signin' | 'forgot' | 'signup' | 'dashboard'>('landing');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -39,8 +90,8 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [toast, setToast] = useState<ToastData | null>(null);
 
-  // Layout mode: 'split' (blended with VTU animation) or 'classic' (exact original centered form)
-  const [layoutMode, setLayoutMode] = useState<'split' | 'classic'>('split');
+  const [showFirebaseModal, setShowFirebaseModal] = useState(false);
+  const firebaseAuthReady = Boolean(auth);
 
   // Forgot password state
   const [forgotEmail, setForgotEmail] = useState('');
@@ -55,6 +106,7 @@ export default function App() {
 
   // Logged-in state
   const [currentUser, setCurrentUser] = useState<{ email: string; name: string } | null>(null);
+  const [authReady, setAuthReady] = useState(!Boolean(auth));
 
   // Auto-dismiss toast
   useEffect(() => {
@@ -65,6 +117,34 @@ export default function App() {
       return () => clearTimeout(timer);
     }
   }, [toast]);
+
+  // Listen to Firebase Auth state changes
+  useEffect(() => {
+    if (!auth) {
+      setAuthReady(true);
+      return;
+    }
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      if (firebaseUser) {
+        const firebaseIdToken = firebaseUser.getIdToken();
+        void firebaseIdToken.then((token) => fetch('/api/cloudflare/profile', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        })).catch(() => undefined);
+        setCurrentUser({
+          email: firebaseUser.email || '',
+          name: firebaseUser.displayName || (firebaseUser.email ? firebaseUser.email.split('@')[0] : 'Agent Partner'),
+        });
+        setView('dashboard');
+      } else {
+        setCurrentUser(null);
+        setView((previousView) => previousView === 'dashboard' ? 'landing' : previousView);
+      }
+      setAuthReady(true);
+    });
+    return () => unsubscribe();
+  }, []);
 
   const showNotification = (
     type: 'success' | 'error' | 'warning' | 'info',
@@ -81,7 +161,72 @@ export default function App() {
     });
   };
 
-  const handleSignIn = (e: React.FormEvent) => {
+  const notifyEmailVerification = (
+    title: string,
+    message = 'A verification message was sent to your email check your (Spam folder) if not found in Inbox'
+  ) => showNotification('warning', title, message, 'center');
+
+  const completePasswordReset = (address: string) => {
+    showNotification(
+      'info',
+      'Reset Link Sent',
+      `A password reset link has been dispatched to ${address}. Check your inbox or spam folder.`
+    );
+    setForgotEmail('');
+    setTimeout(() => setView('signin'), 2000);
+  };
+
+  const completeSignUp = (address: string) => {
+    notifyEmailVerification(
+      'Verify Your Email',
+      'Registration successful! A verification message was sent to your email check your (Spam folder) if not found in Inbox'
+    );
+    setEmail(address);
+    setView('signin');
+  };
+
+  const handleSelectService = (serviceKey: 'data' | 'airtime' | 'exam-pins' | 'electricity') => {
+    const serviceLabels: Record<string, string> = {
+      data: 'Mobile Data',
+      airtime: 'Airtime VTU',
+      'exam-pins': 'Exam Pins',
+      electricity: 'Electricity Payments',
+    };
+    const label = serviceLabels[serviceKey] || 'Digital Services';
+    if (currentUser) {
+      setView('dashboard');
+      showNotification('info', label, `Redirecting to ${label} terminal...`);
+    } else {
+      setView('signin');
+      showNotification('info', label, `Please sign in or create an account to access ${label}.`);
+    }
+  };
+
+  const getFirebaseErrorMessage = (err: any): string => {
+    const code = err?.code || '';
+    switch (code) {
+      case 'auth/user-not-found':
+      case 'auth/wrong-password':
+      case 'auth/invalid-credential':
+        return 'Invalid email or password combination. Please try again.';
+      case 'auth/email-already-in-use':
+        return 'This email address is already registered. Please sign in instead.';
+      case 'auth/weak-password':
+        return 'Password is too weak. Please use at least 6 characters.';
+      case 'auth/invalid-email':
+        return 'Please enter a valid email address.';
+      case 'auth/too-many-requests':
+        return 'Access to this account is temporarily disabled due to many failed attempts. Please reset your password or try again later.';
+      case 'auth/network-request-failed':
+        return 'Network connection error. Please verify your internet connection.';
+      case 'auth/popup-closed-by-user':
+        return 'Sign-in popup was closed before completion.';
+      default:
+        return err?.message || 'An error occurred during authentication. Please try again.';
+    }
+  };
+
+  const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!email || !password) {
       showNotification('error', 'Error', 'Please enter your email and password');
@@ -90,34 +235,55 @@ export default function App() {
 
     setIsLoading(true);
 
-    // Simulate authentic server response matching agenthub backend
-    setTimeout(() => {
+    if (isFirebaseConfigured && !auth) {
       setIsLoading(false);
+      showNotification('error', 'Firebase Unavailable', `Firebase Auth could not initialize${firebaseInitializationErrorCode ? ` (${firebaseInitializationErrorCode})` : ''}.`);
+      return;
+    }
 
-      if (email.toLowerCase() === 'unverified@agenthub.ng') {
-        showNotification(
-          'warning',
-          'Verify Your Email',
-          'A verification message was sent to your email check your (Spam folder) if not found in Inbox',
-          'center'
-        );
-      } else if (password === 'wrong' || password.length < 4) {
-        showNotification('error', 'Error', 'Invalid email or password combination. Please try again.');
-      } else {
-        const userName = email.split('@')[0].replace(/[._]/g, ' ');
-        const formattedName = userName.charAt(0).toUpperCase() + userName.slice(1);
-        setCurrentUser({ email, name: formattedName || 'Agent Partner' });
+    if (isFirebaseConfigured && auth) {
+      try {
+        await setPersistence(auth, rememberMe ? browserLocalPersistence : browserSessionPersistence);
+        const userCredential = await signInWithEmailAndPassword(auth, email, password);
+        const user = userCredential.user;
+        const displayName = user.displayName || email.split('@')[0];
+        setCurrentUser({ email: user.email || email, name: displayName });
 
-        showNotification('success', 'Welcome', 'Login Successfully');
+        if (!user.emailVerified) {
+          notifyEmailVerification('Verify Your Email');
+        } else {
+          showNotification('success', 'Welcome', 'Login Successfully');
+        }
 
-        setTimeout(() => {
-          setView('dashboard');
-        }, 1200);
+        setView('dashboard');
+      } catch (err: any) {
+        showNotification('error', 'Authentication Failed', getFirebaseErrorMessage(err));
+      } finally {
+        setIsLoading(false);
       }
-    }, 1100);
+    } else {
+      // Fallback preview mode when Firebase keys have not yet been placed into .env.local
+      setTimeout(() => {
+        setIsLoading(false);
+
+        if (email.toLowerCase() === 'unverified@agenthub.ng') {
+          notifyEmailVerification('Verify Your Email');
+        } else if (password === 'wrong' || password.length < 4) {
+          showNotification('error', 'Error', 'Invalid email or password combination. Please try again.');
+        } else {
+          const userName = email.split('@')[0].replace(/[._]/g, ' ');
+          const formattedName = userName.charAt(0).toUpperCase() + userName.slice(1);
+          setCurrentUser({ email, name: formattedName || 'Agent Partner' });
+
+          showNotification('success', 'Welcome', 'Login Successfully');
+
+           setView('dashboard');
+        }
+      }, 1100);
+    }
   };
 
-  const handleForgotPassword = (e: React.FormEvent) => {
+  const handleForgotPassword = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!forgotEmail) {
       showNotification('error', 'Error', 'Please enter your registered email address.');
@@ -125,21 +291,25 @@ export default function App() {
     }
 
     setForgotLoading(true);
-    setTimeout(() => {
-      setForgotLoading(false);
-      showNotification(
-        'info',
-        'Reset Link Sent',
-        `A password reset link has been dispatched to ${forgotEmail}. Check your inbox or spam folder.`
-      );
-      setForgotEmail('');
+
+    if (isFirebaseConfigured && auth) {
+      try {
+        await sendPasswordResetEmail(auth, forgotEmail);
+        completePasswordReset(forgotEmail);
+      } catch (err: any) {
+        showNotification('error', 'Error', getFirebaseErrorMessage(err));
+      } finally {
+        setForgotLoading(false);
+      }
+    } else {
       setTimeout(() => {
-        setView('signin');
-      }, 2000);
-    }, 1000);
+        setForgotLoading(false);
+        completePasswordReset(forgotEmail);
+      }, 1000);
+    }
   };
 
-  const handleSignUp = (e: React.FormEvent) => {
+  const handleSignUp = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!signupEmail || !signupPassword || !signupPhone) {
       showNotification('error', 'Error', 'Please fill in all required registration fields.');
@@ -149,22 +319,50 @@ export default function App() {
       showNotification('error', 'Error', 'Passwords do not match.');
       return;
     }
+    if (signupPassword.length < 6) {
+      showNotification('error', 'Error', 'Password must be at least 6 characters.');
+      return;
+    }
 
     setIsLoading(true);
-    setTimeout(() => {
+
+    if (isFirebaseConfigured && !auth) {
       setIsLoading(false);
-      showNotification(
-        'warning',
-        'Verify Your Email',
-        'Registration successful! A verification message was sent to your email check your (Spam folder) if not found in Inbox',
-        'center'
-      );
-      setEmail(signupEmail);
-      setView('signin');
-    }, 1200);
+      showNotification('error', 'Firebase Unavailable', `Firebase Auth could not initialize${firebaseInitializationErrorCode ? ` (${firebaseInitializationErrorCode})` : ''}.`);
+      return;
+    }
+
+    if (isFirebaseConfigured && auth) {
+      try {
+        await setPersistence(auth, browserSessionPersistence);
+        const userCredential = await createUserWithEmailAndPassword(auth, signupEmail, signupPassword);
+        if (signupName) {
+          await updateProfile(userCredential.user, { displayName: signupName });
+        }
+        await sendEmailVerification(userCredential.user);
+
+        completeSignUp(signupEmail);
+      } catch (err: any) {
+        showNotification('error', 'Registration Failed', getFirebaseErrorMessage(err));
+      } finally {
+        setIsLoading(false);
+      }
+    } else {
+      setTimeout(() => {
+        setIsLoading(false);
+        completeSignUp(signupEmail);
+      }, 1200);
+    }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    if (isFirebaseConfigured && auth) {
+      try {
+        await signOut(auth);
+      } catch (err) {
+        console.error('Firebase sign out error:', err);
+      }
+    }
     setCurrentUser(null);
     setEmail('');
     setPassword('');
@@ -188,663 +386,538 @@ export default function App() {
     }
   };
 
-  return (
-    <div
-      style={{
-        backgroundImage: 'url(/assets/img/verifyall_bg.jpg)',
-        backgroundRepeat: 'no-repeat',
-        backgroundSize: 'cover',
-        backgroundPosition: 'center',
-        backgroundAttachment: 'fixed',
-      }}
-      className="min-h-screen w-full relative flex flex-col justify-between text-slate-800 antialiased selection:bg-cyan-500 selection:text-white"
-    >
-      {/* Dark tint overlay for pristine contrast */}
-      <div className="absolute inset-0 bg-slate-950/40 pointer-events-none backdrop-blur-[1.5px]" />
+  const renderToast = () => {
+    if (!toast) return null;
+    return (
+      <div
+        style={{ zIndex: 1000 }}
+        className={`fixed transition-all ${
+          toast.position === 'center'
+            ? 'top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 toast-pop-center max-w-md w-[92vw]'
+            : 'top-5 right-5 toast-slide-in max-w-sm w-[92vw] sm:w-96'
+        }`}
+      >
+        <div
+          className={`relative rounded-xl p-4 shadow-2xl text-white flex items-start space-x-3.5 border ${
+            toast.type === 'success'
+              ? 'bg-emerald-600 border-emerald-500 shadow-emerald-950/40'
+              : toast.type === 'error'
+              ? 'bg-rose-600 border-rose-500 shadow-rose-950/40'
+              : toast.type === 'warning'
+              ? 'bg-amber-500 border-amber-400 text-slate-900 shadow-amber-950/40'
+              : 'bg-sky-600 border-sky-500 shadow-sky-950/40'
+          }`}
+        >
+          <div className="shrink-0 mt-0.5">
+            {toast.type === 'success' && <CheckCircle2 className="w-5 h-5 text-white" />}
+            {toast.type === 'error' && <AlertCircle className="w-5 h-5 text-white" />}
+            {toast.type === 'warning' && <AlertTriangle className="w-5 h-5 text-slate-900" />}
+            {toast.type === 'info' && <Shield className="w-5 h-5 text-white" />}
+          </div>
+          <div className="flex-1 pr-2">
+            <h4
+              className={`font-bold text-sm tracking-wide ${
+                toast.type === 'warning' ? 'text-slate-950' : 'text-white'
+              }`}
+            >
+              {toast.title}
+            </h4>
+            <p
+              className={`text-xs mt-1 leading-relaxed ${
+                toast.type === 'warning' ? 'text-slate-900/90' : 'text-white/95'
+              }`}
+            >
+              {toast.message}
+            </p>
+          </div>
+          <button
+            onClick={() => setToast(null)}
+            className="shrink-0 opacity-80 hover:opacity-100 transition-opacity p-1 rounded-md cursor-pointer"
+            aria-label="Close notification"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+    );
+  };
 
-      {/* Loading Overlay with authentic bouncing verifyall logo */}
+  if (!authReady) {
+    return <div className="flex min-h-screen items-center justify-center bg-[#f4f8ff] text-sm font-semibold text-[#234577]">Checking your account…</div>;
+  }
+
+  const renderFirebaseModal = () => {
+    if (!showFirebaseModal) return null;
+    return (
+      <div
+        style={{ zIndex: 1100 }}
+        className="fixed inset-0 flex items-center justify-center p-4 bg-slate-950/75 backdrop-blur-sm"
+      >
+        <div className="w-full max-w-xl bg-slate-900 border border-sky-700/80 rounded-2xl shadow-2xl p-6 text-white space-y-4">
+          <div className="flex items-center justify-between pb-3 border-b border-sky-800">
+            <div className="flex items-center space-x-2.5">
+              <div className="p-2 bg-amber-500/20 text-amber-400 rounded-lg">
+                <Key className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-lg font-bold">Firebase Configuration</h3>
+                <p className="text-xs text-cyan-200">Connect your Firebase Authentication project</p>
+              </div>
+            </div>
+            <button
+              onClick={() => setShowFirebaseModal(false)}
+              className="p-1 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+
+          <div className="space-y-3 text-xs">
+            <div className={`p-3.5 rounded-xl border flex items-start space-x-3 ${
+              firebaseAuthReady
+                ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-200'
+                : 'bg-amber-950/50 border-amber-500/40 text-amber-200'
+            }`}>
+              {firebaseAuthReady ? (
+                <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+              ) : (
+                <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+              )}
+              <div>
+                <p className="font-bold text-sm">
+                  {firebaseAuthReady
+                    ? 'Firebase SDK is initialized and connected!'
+                    : 'Firebase credentials not yet provided'}
+                </p>
+                <p className="mt-1 leading-relaxed opacity-90">
+                  {firebaseAuthReady
+                    ? `Project ID: "${firebaseConfig.projectId}". Logins and sign-ups connect to your live Firebase Auth.`
+                    : 'The project is ready! Simply paste your Firebase web config keys into .env.local to enable real sign-in, registration, and password recovery.'}
+                </p>
+              </div>
+            </div>
+
+            <div className="bg-slate-950 p-4 rounded-xl border border-sky-900 space-y-2">
+              <span className="font-bold text-cyan-300 uppercase tracking-wider text-[11px] block">
+                Quick Setup Steps:
+              </span>
+              <ol className="list-decimal list-inside space-y-1.5 text-slate-300">
+                <li>Open <a href="https://console.firebase.google.com" target="_blank" rel="noreferrer" className="text-cyan-400 underline font-semibold">Firebase Console</a> and select your project.</li>
+                <li>Click <strong>Project Settings (Gear icon)</strong> &gt; <strong>General</strong> &gt; <strong>Your apps</strong> &gt; <strong>Web App (&lt;/&gt;)</strong>.</li>
+                <li>In Firebase Console, ensure <strong>Authentication &gt; Sign-in method &gt; Email/Password</strong> is enabled.</li>
+                <li>Open <code className="text-cyan-300 bg-sky-950 px-1.5 py-0.5 rounded">.env.local</code> in your project root and paste the values.</li>
+              </ol>
+            </div>
+
+            <div className="bg-slate-950 p-3 rounded-xl border border-sky-900 font-mono text-[11px] text-cyan-200 overflow-x-auto">
+              <div className="text-slate-400"># Located in .env.local:</div>
+              <div>VITE_FIREBASE_API_KEY="{firebaseConfig.apiKey ? '••••••••' : ''}"</div>
+              <div>VITE_FIREBASE_AUTH_DOMAIN="{firebaseConfig.authDomain || ''}"</div>
+              <div>VITE_FIREBASE_PROJECT_ID="{firebaseConfig.projectId || ''}"</div>
+              <div>VITE_FIREBASE_APP_ID="{firebaseConfig.appId || ''}"</div>
+            </div>
+          </div>
+
+          <div className="flex justify-end pt-2">
+            <button
+              onClick={() => setShowFirebaseModal(false)}
+              className="px-4 py-2 bg-sky-700 hover:bg-sky-600 text-white rounded-lg font-semibold text-xs cursor-pointer"
+            >
+              Got it
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // 1. PUBLIC LANDING PAGE VIEW
+  if (view === 'landing') {
+    return (
+      <>
+        {renderToast()}
+        <LandingPage
+          onSignIn={() => setView('signin')}
+          onSignUp={() => setView('signup')}
+          onSelectService={handleSelectService}
+          isFirebaseConfigured={firebaseAuthReady}
+          onOpenFirebaseModal={() => setShowFirebaseModal(true)}
+        />
+        {renderFirebaseModal()}
+      </>
+    );
+  }
+
+  return (
+    <div className="min-h-screen w-full flex flex-col text-slate-800 antialiased selection:bg-blue-500 selection:text-white" style={{ fontFamily: "'Inter', 'Plus Jakarta Sans', system-ui, sans-serif" }}>
+
+      {/* Loading Overlay */}
       {isLoading && (
         <div
           style={{ zIndex: 999 }}
-          className="fixed inset-0 flex items-center justify-center transition-all duration-300 backdrop-blur-sm bg-slate-900/50"
+          className="fixed inset-0 flex items-center justify-center transition-all duration-300 backdrop-blur-sm bg-slate-900/60"
         >
-          <div className="flex flex-col items-center bg-slate-900/85 p-8 rounded-2xl border border-sky-600/50 shadow-2xl backdrop-blur-md">
+          <div className="flex flex-col items-center bg-white p-8 rounded-2xl border border-blue-100 shadow-2xl">
             <img
-              src="/assets/img/verifyall-2.png"
+              src="/assets/img/sameduhub-logo-transparent.png"
               alt="Loading..."
-              className="loader_img w-20 h-auto drop-shadow-2xl"
+              className="loader_img w-16 h-auto drop-shadow-xl"
             />
-            <p className="mt-4 text-xs font-bold uppercase tracking-widest text-cyan-200">
-              Authenticating Credentials...
+            <p className="mt-4 text-xs font-bold uppercase tracking-widest text-blue-700">
+              Authenticating...
             </p>
           </div>
         </div>
       )}
 
-      {/* Toast Notification (Balloon matching iziToast) */}
-      {toast && (
-        <div
-          style={{ zIndex: 1000 }}
-          className={`fixed transition-all ${
-            toast.position === 'center'
-              ? 'top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 toast-pop-center max-w-md w-[92vw]'
-              : 'top-5 right-5 toast-slide-in max-w-sm w-[92vw] sm:w-96'
-          }`}
-        >
-          <div
-            className={`relative rounded-xl p-4 shadow-2xl text-white flex items-start space-x-3.5 border ${
-              toast.type === 'success'
-                ? 'bg-emerald-600 border-emerald-500 shadow-emerald-950/40'
-                : toast.type === 'error'
-                ? 'bg-rose-600 border-rose-500 shadow-rose-950/40'
-                : toast.type === 'warning'
-                ? 'bg-amber-500 border-amber-400 text-slate-900 shadow-amber-950/40'
-                : 'bg-sky-600 border-sky-500 shadow-sky-950/40'
-            }`}
-          >
-            <div className="shrink-0 mt-0.5">
-              {toast.type === 'success' && <CheckCircle2 className="w-5 h-5 text-white" />}
-              {toast.type === 'error' && <AlertCircle className="w-5 h-5 text-white" />}
-              {toast.type === 'warning' && <AlertTriangle className="w-5 h-5 text-slate-900" />}
-              {toast.type === 'info' && <Shield className="w-5 h-5 text-white" />}
-            </div>
-            <div className="flex-1 pr-2">
-              <h4
-                className={`font-bold text-sm tracking-wide ${
-                  toast.type === 'warning' ? 'text-slate-950' : 'text-white'
-                }`}
-              >
-                {toast.title}
-              </h4>
-              <p
-                className={`text-xs mt-1 leading-relaxed ${
-                  toast.type === 'warning' ? 'text-slate-900/90' : 'text-white/95'
-                }`}
-              >
-                {toast.message}
-              </p>
-            </div>
-            <button
-              onClick={() => setToast(null)}
-              className="shrink-0 opacity-80 hover:opacity-100 transition-opacity p-1 rounded-md cursor-pointer"
-              aria-label="Close notification"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-      )}
+      {/* Toast Notification */}
+      {renderToast()}
 
-      {/* Main Content Area */}
-      <div className="relative z-10 flex-1 flex flex-col justify-center items-center px-4 py-8 sm:px-6">
-        {/* LOGGED IN AGENT PORTAL DASHBOARD */}
+      {/* Main Content */}
+      <div className="flex-1 flex flex-col">
+        {/* DASHBOARD VIEW */}
         {view === 'dashboard' && currentUser ? (
-          <section className="w-full max-w-5xl mx-auto my-auto py-6">
-            <div className="bg-sky-900/90 backdrop-blur-xl border border-sky-700/80 rounded-2xl shadow-2xl overflow-hidden text-white">
-              {/* Header */}
-              <div className="bg-sky-950/80 px-6 py-4 flex flex-wrap items-center justify-between border-b border-sky-800 gap-4">
-                <div className="flex items-center space-x-3">
-                  <div className="w-11 h-11 rounded-xl bg-white/10 p-1 border border-cyan-400/30 flex items-center justify-center">
+          <DashboardErrorBoundary>
+            <UserDashboard
+              currentUser={currentUser}
+              onLogout={handleLogout}
+              onHome={() => setView('landing')}
+              onNotify={(title, message) => showNotification('info', title, message)}
+              onProfileUpdated={(name) => setCurrentUser((user) => user ? { ...user, name } : user)}
+            />
+          </DashboardErrorBoundary>
+        ) : (
+          /* ============================================================
+             AUTH SCREENS — NEW SPLIT PANEL DESIGN (matches reference)
+             ============================================================ */
+          <div className="flex-1 flex flex-col lg:flex-row min-h-screen">
+
+            {/* ── LEFT PANEL: Dark Blue Branding ── */}
+            <div
+              className="relative lg:w-[48%] xl:w-[45%] flex-shrink-0 flex flex-col justify-between overflow-hidden"
+              style={{ background: 'linear-gradient(135deg, #0d2b8e 0%, #1a3fbd 40%, #1253d4 70%, #0b2070 100%)' }}
+            >
+              {/* Background blobs */}
+              <div className="absolute top-[-80px] right-[-60px] w-72 h-72 rounded-full opacity-20" style={{ background: 'radial-gradient(circle, #3b7fff 0%, transparent 70%)' }} />
+              <div className="absolute bottom-[-60px] left-[-40px] w-64 h-64 rounded-full opacity-15" style={{ background: 'radial-gradient(circle, #ff7b00 0%, transparent 70%)' }} />
+              <div className="absolute top-[40%] left-[-30px] w-48 h-48 rounded-full opacity-10" style={{ background: 'radial-gradient(circle, #60a5fa 0%, transparent 70%)' }} />
+
+              <div className="relative z-10 p-8 lg:p-10 flex flex-col h-full">
+                {/* Logo + Nav */}
+                <div className="flex items-center justify-between">
+                  <button onClick={() => setView('landing')} className="flex items-center space-x-3 group cursor-pointer">
+                    <div className="w-10 h-10 rounded-xl bg-white/15 backdrop-blur-sm border border-white/20 flex items-center justify-center group-hover:bg-white/25 transition-all">
+                      <img src="/assets/img/sameduhub-logo-transparent.png" alt="SamEduHub" className="w-7 h-7 object-contain" />
+                    </div>
+                    <div>
+                      <span className="font-bold text-white text-lg"><span className="text-white">Sam</span><span className="text-[#ff9c2a]">EduHub</span></span>
+                      <p className="text-[10px] text-blue-200 -mt-0.5">Data • Airtime • Exam Pins • Bills</p>
+                    </div>
+                  </button>
+                </div>
+
+                {/* Hero copy */}
+                <div className="mt-10 mb-6">
+                  <h1 className="text-3xl lg:text-4xl font-extrabold text-white leading-tight tracking-tight">
+                    Your Digital Services
+                  </h1>
+                  <h2 className="text-3xl lg:text-4xl font-extrabold leading-tight tracking-tight" style={{ color: '#ff9c2a' }}>
+                    Made Simple.
+                  </h2>
+                  <p className="mt-4 text-sm text-blue-200 leading-relaxed max-w-sm">
+                    Buy data bundles, recharge airtime, pay electricity bills and get examination pins — all in one place.
+                  </p>
+                </div>
+
+                {/* Feature list */}
+                <div className="space-y-4 mb-8">
+                  {[
+                    { icon: Database, label: 'Buy Data', sub: 'Stay connected always', color: '#2563eb' },
+                    { icon: Smartphone, label: 'Buy Airtime', sub: 'Recharge your line', color: '#f97316' },
+                    { icon: Sparkles, label: 'Exam Pins', sub: 'Get examination pins', color: '#2563eb' },
+                    { icon: Zap, label: 'Electricity Bills', sub: 'Pay your bills with ease', color: '#2563eb' },
+                  ].map((f, i) => {
+                    const FIcon = f.icon;
+                    return (
+                      <div key={i} className="flex items-center space-x-4">
+                        <div className="w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 border border-white/20" style={{ background: 'rgba(255,255,255,0.12)' }}>
+                          <FIcon className="w-5 h-5 text-white" />
+                        </div>
+                        <div>
+                          <div className="font-bold text-white text-sm">{f.label}</div>
+                          <div className="text-blue-200 text-xs">{f.sub}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Phone mockup */}
+                <div className="flex-1 flex items-end justify-center">
+                  <div className="relative w-full max-w-xs">
                     <img
-                      src="/assets/img/sameduhub-logo-transparent.png"
-                      alt="SamEduHub"
-                      className="w-full h-full object-contain"
+                      src="/assets/img/phone-mockup.jpg"
+                      alt="SamEduHub App"
+                      className="w-full object-contain drop-shadow-2xl"
+                      style={{ maxHeight: '340px', borderRadius: '16px' }}
                     />
                   </div>
-                  <div>
-                    <div className="flex items-center space-x-2">
-                      <span className="font-bold text-lg text-white">SamEduHub Portal</span>
-                      <span className="bg-emerald-500/20 text-emerald-300 text-[10px] font-bold px-2 py-0.5 rounded-full border border-emerald-500/40 uppercase">
-                        Verified Agent
-                      </span>
-                    </div>
-                    <p className="text-xs text-cyan-300">{currentUser.email}</p>
-                  </div>
                 </div>
 
-                <div className="flex items-center space-x-3">
-                  <div className="bg-sky-800/80 border border-sky-700 px-3.5 py-1.5 rounded-lg flex items-center space-x-2">
-                    <Wallet className="w-4 h-4 text-cyan-300" />
-                    <div>
-                      <div className="text-[10px] text-cyan-200 uppercase font-semibold">Wallet Balance</div>
-                      <div className="text-sm font-extrabold text-white">₦78,450.00</div>
-                    </div>
-                  </div>
-                  <button
-                    onClick={handleLogout}
-                    className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-semibold bg-rose-600 hover:bg-rose-700 rounded-lg transition-colors cursor-pointer shadow-sm"
-                  >
-                    <LogOut className="w-3.5 h-3.5" />
-                    <span>Sign Out</span>
-                  </button>
-                </div>
-              </div>
-
-              {/* Main Body */}
-              <div className="p-6 space-y-6">
-                {/* Welcome Card & Live VTU Terminal */}
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-center">
-                  <div className="lg:col-span-5 space-y-3">
-                    <div className="inline-flex items-center space-x-2 px-2.5 py-1 rounded-full bg-cyan-500/20 text-cyan-300 text-[11px] font-bold border border-cyan-500/30">
-                      <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
-                      <span>VTU GATEWAY SYNCHRONIZED</span>
-                    </div>
-                    <h2 className="text-xl font-bold text-white">
-                      Welcome back, {currentUser.name}!
-                    </h2>
-                    <p className="text-xs sm:text-sm text-cyan-100/90 leading-relaxed">
-                      Your agent terminal is active for instant MTN, Airtel, Glo & 9mobile VTU recharges, electricity tokens, and NIN verification slips.
-                    </p>
-                    <div className="pt-2 flex flex-wrap gap-2.5">
-                      <button
-                        onClick={() => showNotification('info', 'Monnify Gateway', 'Redirecting to Monnify funding portal...')}
-                        className="px-4 py-2 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold rounded-lg text-xs tracking-wider uppercase shadow cursor-pointer transition-all"
-                      >
-                        + Fund Wallet
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="lg:col-span-7">
-                    <VtuAnimation />
-                  </div>
-                </div>
-
-                {/* Services Grid */}
-                <div>
-                  <h3 className="text-sm font-bold text-cyan-200 uppercase tracking-wider mb-3">
-                    Available Agent Services
-                  </h3>
-                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3.5">
-                    {[
-                      { icon: Shield, title: 'NIN Slip & Search', desc: 'Premium & Standard Slip', color: 'from-emerald-500 to-teal-600' },
-                      { icon: FileText, title: 'BVN Services', desc: 'Validation & Retrieval', color: 'from-blue-500 to-indigo-600' },
-                      { icon: Smartphone, title: 'Airtime & Data', desc: 'MTN, Airtel, Glo, 9mobile', color: 'from-amber-500 to-orange-600' },
-                      { icon: Zap, title: 'Electricity Bills', desc: 'All Nigerian DISCOs', color: 'from-purple-500 to-pink-600' },
-                      { icon: Tv, title: 'Cable TV Subs', desc: 'DStv, GOtv, Startimes', color: 'from-cyan-500 to-blue-600' },
-                      { icon: CreditCard, title: 'Airtime to Cash', desc: 'Instant 85% conversion', color: 'from-rose-500 to-red-600' },
-                      { icon: ExternalLink, title: 'CAC Business', desc: 'Registration & Filing', color: 'from-indigo-500 to-violet-600' },
-                      { icon: RefreshCw, title: 'JAMB Pins', desc: 'DE & UTME e-PINs', color: 'from-teal-500 to-emerald-600' },
-                    ].map((srv, idx) => {
-                      const IconComp = srv.icon;
-                      return (
-                        <div
-                          key={idx}
-                          onClick={() => showNotification('info', srv.title, `${srv.title} service terminal ready.`)}
-                          className="p-3.5 rounded-xl bg-sky-950/60 hover:bg-sky-950 border border-sky-800/80 hover:border-cyan-400/50 transition-all cursor-pointer group shadow-sm hover:shadow-cyan-500/10"
-                        >
-                          <div className={`w-8 h-8 rounded-lg bg-gradient-to-br ${srv.color} flex items-center justify-center text-white mb-2 shadow`}>
-                            <IconComp className="w-4 h-4" />
-                          </div>
-                          <div className="font-bold text-xs text-white group-hover:text-cyan-300 transition-colors">
-                            {srv.title}
-                          </div>
-                          <div className="text-[11px] text-cyan-300/70 mt-0.5 truncate">
-                            {srv.desc}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                {/* Back to sign in / switch toggle */}
-                <div className="pt-2 flex justify-between items-center text-xs text-cyan-300 border-t border-sky-800">
-                  <span>Terminal ID: AH-NG-88492</span>
-                  <button
-                    onClick={() => setView('signin')}
-                    className="hover:underline text-white font-semibold cursor-pointer"
-                  >
-                    Switch back to Sign In page
-                  </button>
+                {/* Tagline */}
+                <div className="mt-6">
+                  <p className="text-white/90 italic font-semibold text-lg" style={{ fontFamily: 'Georgia, serif' }}>
+                    Simple. Convenient.
+                  </p>
+                  <p className="text-white/90 italic font-semibold text-lg" style={{ fontFamily: 'Georgia, serif' }}>
+                    Built for you.
+                  </p>
+                  <div className="mt-2 h-0.5 w-24 rounded-full" style={{ background: '#ff9c2a' }} />
                 </div>
               </div>
             </div>
-          </section>
-        ) : (
-          /* AUTH SCREENS: SIGN IN / FORGOT / SIGN UP */
-          <div className="w-full max-w-6xl mx-auto flex items-center justify-center my-auto">
-            {layoutMode === 'split' ? (
-              /* BLENDED HERO + FORM SPLIT LAYOUT */
-              <div className="w-full grid grid-cols-1 lg:grid-cols-12 gap-8 lg:gap-12 items-center my-auto">
-                {/* Left Side: Animated VTU Terminal Showcase */}
-                <div className="lg:col-span-7 flex flex-col justify-center space-y-6 text-white order-2 lg:order-1">
-                  {/* Status chip */}
-                  <div className="inline-flex items-center space-x-2.5 px-3.5 py-1.5 rounded-full bg-[#071b42]/85 border border-[#2588ed]/40 backdrop-blur-md self-start shadow-md shadow-[#071b42]/30">
-                    <span className="w-2.5 h-2.5 rounded-full bg-[#ff941f] animate-pulse shadow-[0_0_10px_rgba(255,148,31,0.55)]" />
-                    <span className="text-xs font-bold text-blue-100 uppercase tracking-wider">
-                      Automated VTU & Utility Technology Services
-                    </span>
-                  </div>
 
-                  <div>
-                    <h1 className="text-3xl sm:text-4xl lg:text-5xl font-extrabold tracking-tight text-white leading-tight">
-                      Automated Multi-Network{' '}
-                      <span className="text-transparent bg-clip-text bg-gradient-to-r from-[#55adff] via-[#1680f5] to-[#ff941f]">
-                        VTU & Agency Banking
-                      </span>
-                    </h1>
-                    <div className="mt-3 h-1 w-24 rounded-full bg-gradient-to-r from-[#1680f5] via-[#ff941f] to-[#ffb54a]" />
-                    <p className="mt-3 text-sm sm:text-base text-cyan-100/90 leading-relaxed max-w-xl">
-                      Instant automated delivery for MTN, Airtel, Glo, 9mobile data & airtime bundles, prepaid electricity tokens, cable subscriptions, and NIN digital identity slips.
-                    </p>
-                  </div>
+            {/* ── RIGHT PANEL: Auth Form ── */}
+            <div className="flex-1 bg-white flex flex-col">
+              {/* Top bar: Already have account */}
+              <div className="flex items-center justify-end px-8 py-5 border-b border-slate-100">
+                {view === 'signup' ? (
+                  <>
+                    <span className="text-sm text-slate-500 mr-3">Already have an account?</span>
+                    <button
+                      onClick={() => setView('signin')}
+                      className="px-5 py-2 rounded-lg border-2 border-blue-600 text-blue-600 font-semibold text-sm hover:bg-blue-600 hover:text-white transition-all cursor-pointer"
+                    >
+                      Sign In
+                    </button>
+                  </>
+                ) : view === 'signin' ? (
+                  <>
+                    <span className="text-sm text-slate-500 mr-3">Don't have an account?</span>
+                    <button
+                      onClick={() => setView('signup')}
+                      className="px-5 py-2 rounded-lg border-2 border-blue-600 text-blue-600 font-semibold text-sm hover:bg-blue-600 hover:text-white transition-all cursor-pointer"
+                    >
+                      Sign Up
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <span className="text-sm text-slate-500 mr-3">Remember your password?</span>
+                    <button
+                      onClick={() => setView('signin')}
+                      className="px-5 py-2 rounded-lg border-2 border-blue-600 text-blue-600 font-semibold text-sm hover:bg-blue-600 hover:text-white transition-all cursor-pointer"
+                    >
+                      Sign In
+                    </button>
+                  </>
+                )}
+              </div>
 
-                  {/* VTU Animation Component */}
-                  <VtuAnimation />
-                </div>
-
-                {/* Right Side: Exact Authentic AgentHub Form */}
-                <div className="lg:col-span-5 flex flex-col items-center justify-center order-1 lg:order-2">
+              {/* Form area */}
+              <div className="flex-1 flex items-center justify-center px-6 py-8 overflow-y-auto">
+                <div className="w-full max-w-md">
                   {renderAuthCard()}
                 </div>
               </div>
-            ) : (
-              /* CLASSIC CENTERED AUTH VIEW (Exact original layout) */
-              <div className="w-full flex flex-col items-center justify-center my-auto">
-                {renderAuthCard()}
+
+              {/* Developer footer bar */}
+              <div className="border-t border-slate-100 bg-slate-50 py-2.5 px-6 text-xs text-slate-400 flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                  <span className="font-semibold text-slate-600">SamEduHub</span>
+                  <span className="text-slate-400">sameduhub/sign-in</span>
+                  <button
+                    onClick={() => setShowFirebaseModal(true)}
+                    className={`ml-2 inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold border transition-all cursor-pointer ${
+                      firebaseAuthReady
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-300 hover:bg-emerald-100'
+                        : 'bg-amber-50 text-amber-700 border-amber-300 hover:bg-amber-100'
+                    }`}
+                  >
+                    <Database className="w-3 h-3" />
+                    <span>{firebaseAuthReady ? 'Firebase: Connected' : 'Firebase: Setup'}</span>
+                  </button>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button onClick={() => setView('landing')} className="px-2 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded text-[11px] font-medium cursor-pointer flex items-center space-x-1">
+                    <Home className="w-3 h-3" /><span>Home</span>
+                  </button>
+                  <span className="text-slate-300">|</span>
+                  <span className="text-slate-500">Quick Fill:</span>
+                  <button onClick={() => { setView('signin'); fillDemoAccount('valid'); }} className="px-2 py-1 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-[11px] font-medium cursor-pointer">Valid</button>
+                  <button onClick={() => { setView('signin'); fillDemoAccount('unverified'); }} className="px-2 py-1 bg-amber-100 hover:bg-amber-200 text-amber-700 rounded text-[11px] font-medium cursor-pointer">Unverified</button>
+                  <button onClick={() => { setView('signin'); fillDemoAccount('wrong'); }} className="px-2 py-1 bg-rose-100 hover:bg-rose-200 text-rose-700 rounded text-[11px] font-medium cursor-pointer">Wrong Pwd</button>
+                </div>
               </div>
-            )}
+            </div>
+
           </div>
         )}
       </div>
 
-      {/* Demo Credentials & Quick Test Helper Floating Bar */}
-      <div className="relative z-20 w-full bg-slate-950/90 backdrop-blur-md border-t border-sky-800/60 py-2.5 px-4 text-xs text-slate-300">
-        <div className="max-w-6xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
-          <div className="flex items-center space-x-2.5">
-            <span className="inline-block w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
-            <span className="font-semibold text-white">SamEduHub:</span>
-            <span className="text-cyan-200">sameduhub/sign-in</span>
-
-            {/* Layout Mode Toggle */}
-            <div className="ml-3 pl-3 border-l border-sky-800 flex items-center space-x-1.5">
-              <button
-                onClick={() => setLayoutMode(layoutMode === 'split' ? 'classic' : 'split')}
-                className={`px-2.5 py-1 rounded-md text-[11px] font-semibold border transition-all cursor-pointer flex items-center space-x-1 ${
-                  layoutMode === 'split'
-                    ? 'bg-cyan-500/20 text-cyan-300 border-cyan-400/40'
-                    : 'bg-sky-900/60 text-slate-300 border-sky-700 hover:text-white'
-                }`}
-              >
-                <Layers className="w-3 h-3" />
-                <span>{layoutMode === 'split' ? 'VTU Blended View (Active)' : 'Centered Form Only'}</span>
-              </button>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-slate-400 text-[11px]">Quick Fill:</span>
-            <button
-              onClick={() => {
-                setView('signin');
-                fillDemoAccount('valid');
-              }}
-              className="px-2.5 py-1 bg-sky-800 hover:bg-sky-700 text-white rounded font-medium text-[11px] transition-colors cursor-pointer border border-sky-600"
-            >
-              Valid Login
-            </button>
-            <button
-              onClick={() => {
-                setView('signin');
-                fillDemoAccount('unverified');
-              }}
-              className="px-2.5 py-1 bg-amber-600/80 hover:bg-amber-600 text-white rounded font-medium text-[11px] transition-colors cursor-pointer border border-amber-500"
-            >
-              Unverified Email
-            </button>
-            <button
-              onClick={() => {
-                setView('signin');
-                fillDemoAccount('wrong');
-              }}
-              className="px-2.5 py-1 bg-rose-700/80 hover:bg-rose-700 text-white rounded font-medium text-[11px] transition-colors cursor-pointer border border-rose-600"
-            >
-              Wrong Password
-            </button>
-          </div>
-        </div>
-      </div>
+      {/* Firebase Credentials Modal */}
+      {renderFirebaseModal()}
     </div>
   );
 
   function renderAuthCard() {
     return (
       <>
-        {/* SIGN IN VIEW */}
+        {/* ═══════════════ SIGN IN ═══════════════ */}
         {view === 'signin' && (
-          <section className="w-full flex flex-col items-center justify-center">
-            {/* Logo link matching original markup */}
-            <a
-              href="#"
-              onClick={(e) => e.preventDefault()}
-              className="flex items-center mb-5 text-2xl font-semibold group focus:outline-none"
-              title="SamEduHub"
-            >
-              <div className="rounded-2xl w-20 h-20 overflow-hidden shadow-xl bg-white/10 p-1 backdrop-blur-xs transition-transform duration-300 group-hover:scale-105">
-                <img
-                  src="/assets/img/sameduhub-logo-transparent.png"
-                  alt="SamEduHub Logo"
-                  className="w-full h-full object-contain"
-                />
-              </div>
-            </a>
+          <div className="w-full">
+            <AuthBrand />
 
-            {/* Auth Card with original classes: bg-sky-800 border-sky-700 */}
-            <div className="w-full rounded-2xl shadow-2xl border md:mt-0 sm:max-w-md xl:p-0 bg-sky-800 border-sky-700 backdrop-blur-md">
-              <div className="p-6 space-y-4 md:space-y-6 sm:p-8">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-xl font-bold leading-tight tracking-tight text-white md:text-2xl">
-                    Sign in to your account
-                  </h2>
-                </div>
+            <h2 className="text-2xl font-extrabold text-slate-900 mb-1">Welcome Back!</h2>
+            <p className="text-sm text-slate-500 mb-7">Sign in to your SamEduHub account to continue.</p>
 
-                <form className="space-y-4 md:space-y-5" id="login_form" onSubmit={handleSignIn}>
-                  {/* Email Field */}
-                  <div>
-                    <label
-                      htmlFor="email"
-                      className="block mb-2 text-sm font-medium text-white"
-                    >
-                      Your email
-                    </label>
-                    <input
-                      type="email"
-                      name="email"
-                      id="email"
-                      value={email}
-                      onChange={(e) => setEmail(e.target.value)}
-                      className="border py-2.5 px-3 sm:text-sm rounded-lg block w-full bg-white border-cyan-600 text-slate-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 shadow-inner"
-                      placeholder="your@email.com"
-                      required
-                    />
-                  </div>
+            <form id="login_form" onSubmit={handleSignIn} className="space-y-4">
+              <AuthField
+                type="email"
+                id="signin_email"
+                name="email"
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+                placeholder="Email Address"
+                icon={<Mail className="w-[18px] h-[18px]" />}
+                required
+              />
 
-                  {/* Password Field */}
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
-                      <label
-                        htmlFor="password"
-                        className="block text-sm font-medium text-white"
-                      >
-                        Password
-                      </label>
-                      <button
-                        type="button"
-                        onClick={() => setShowPassword(!showPassword)}
-                        className="text-xs text-cyan-200 hover:text-white flex items-center space-x-1 focus:outline-none cursor-pointer"
-                        tabIndex={-1}
-                      >
-                        {showPassword ? (
-                          <>
-                            <EyeOff className="w-3.5 h-3.5" />
-                            <span>Hide</span>
-                          </>
-                        ) : (
-                          <>
-                            <Eye className="w-3.5 h-3.5" />
-                            <span>Show</span>
-                          </>
-                        )}
-                      </button>
-                    </div>
-                    <div className="relative">
-                      <input
-                        type={showPassword ? 'text' : 'password'}
-                        name="password"
-                        id="password"
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
-                        placeholder="••••••••"
-                        className="border py-2.5 px-3 sm:text-sm rounded-lg block w-full bg-white border-cyan-600 text-slate-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 shadow-inner"
-                        required
-                      />
-                    </div>
-                  </div>
-
-                  {/* Remember Me & Forgot Password Row */}
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-start">
-                      <div className="flex items-center h-5">
-                        <input
-                          id="remember"
-                          aria-describedby="remember"
-                          type="checkbox"
-                          checked={rememberMe}
-                          onChange={(e) => setRememberMe(e.target.checked)}
-                          className="w-4 h-4 border border-cyan-300 rounded bg-cyan-700 text-blue-600 focus:ring-2 focus:ring-primary-600 ring-offset-cyan-800 cursor-pointer"
-                        />
-                      </div>
-                      <div className="ml-2.5 text-sm">
-                        <label
-                          htmlFor="remember"
-                          className="text-cyan-300 cursor-pointer select-none text-xs sm:text-sm"
-                        >
-                          Remember me
-                        </label>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setView('forgot')}
-                      className="text-xs sm:text-sm text-white font-bold hover:underline focus:outline-none cursor-pointer"
-                    >
-                      Forgot password?
-                    </button>
-                  </div>
-
-                  {/* Submit Button */}
-                  <button
-                    type="submit"
-                    disabled={isLoading}
-                    className="w-full text-white bg-slate-900 hover:bg-slate-950 focus:ring-4 focus:outline-none focus:ring-blue-400/40 font-semibold rounded-lg text-sm px-5 py-3 text-center transition-all duration-200 cursor-pointer shadow-lg active:scale-[0.99] disabled:opacity-70 disabled:cursor-not-allowed"
-                  >
-                    {isLoading ? 'Signing in...' : 'Sign in'}
+              <AuthField
+                type={showPassword ? 'text' : 'password'}
+                id="signin_password"
+                name="password"
+                value={password}
+                onChange={e => setPassword(e.target.value)}
+                placeholder="Password"
+                className="pr-12"
+                icon={<LockKeyhole className="w-[18px] h-[18px]" />}
+                endAdornment={(
+                  <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer" tabIndex={-1}>
+                    {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
                   </button>
+                )}
+                required
+              />
 
-                  {/* Sign up prompt */}
-                  <div className="text-center pt-1 border-t border-sky-700/60">
-                    <p className="text-xs sm:text-sm font-light text-cyan-200">
-                      Don’t have an account yet?{' '}
-                      <button
-                        type="button"
-                        onClick={() => setView('signup')}
-                        className="text-white font-bold hover:underline focus:outline-none cursor-pointer"
-                      >
-                        Sign up
-                      </button>
-                    </p>
-                  </div>
-                </form>
+              {/* Remember & Forgot */}
+              <div className="flex items-center justify-between">
+                <label className="flex items-center space-x-2 cursor-pointer">
+                  <input id="remember" type="checkbox" checked={rememberMe} onChange={e => setRememberMe(e.target.checked)} className="w-4 h-4 rounded border-slate-300 text-blue-600 cursor-pointer" />
+                  <span className="text-sm text-slate-600">Remember me</span>
+                </label>
+                <button type="button" onClick={() => setView('forgot')} className="text-sm font-semibold text-blue-600 hover:text-blue-700 hover:underline cursor-pointer">Forgot password?</button>
               </div>
-            </div>
-          </section>
+
+              <AuthSubmitButton id="signin_submit" isLoading={isLoading} loadingLabel="Signing in...">
+                Sign In
+              </AuthSubmitButton>
+              <AuthDivider className="my-1" />
+              <GoogleAuthButton id="google_signin" label="Continue with Google" onClick={() => showNotification('info', 'Google Sign-In', 'Google OAuth coming soon!')} />
+              <AuthTerms action="signing in" className="mt-2" />
+            </form>
+          </div>
         )}
 
-        {/* FORGOT PASSWORD VIEW */}
+        {/* ═══════════════ FORGOT PASSWORD ═══════════════ */}
         {view === 'forgot' && (
-          <section className="w-full flex flex-col items-center justify-center">
-            <a
-              href="#"
-              onClick={(e) => e.preventDefault()}
-              className="flex items-center mb-5 text-2xl font-semibold"
-            >
-              <div className="rounded-2xl w-20 h-20 overflow-hidden shadow-xl bg-white/10 p-1 backdrop-blur-xs">
-                <img
-                  src="/assets/img/sameduhub-logo-transparent.png"
-                  alt="SamEduHub Logo"
-                  className="w-full h-full object-contain"
-                />
-              </div>
-            </a>
+          <div className="w-full">
+            <AuthBrand />
 
-            <div className="w-full rounded-2xl shadow-2xl border md:mt-0 sm:max-w-md xl:p-0 bg-sky-800 border-sky-700 backdrop-blur-md">
-              <div className="p-6 space-y-4 md:space-y-6 sm:p-8">
-                <div>
-                  <h2 className="text-xl font-bold leading-tight tracking-tight text-white md:text-2xl">
-                    Reset your password
-                  </h2>
-                  <p className="text-xs sm:text-sm text-cyan-200 mt-1.5 leading-relaxed">
-                    Enter the email address registered with your SamEduHub account, and we’ll send you a password recovery link.
-                  </p>
-                </div>
+            <h2 className="text-2xl font-extrabold text-slate-900 mb-1">Reset Password</h2>
+            <p className="text-sm text-slate-500 mb-7">
+              Enter your registered email and we'll send you a password reset link.
+            </p>
 
-                <form className="space-y-4 md:space-y-5" onSubmit={handleForgotPassword}>
-                  <div>
-                    <label
-                      htmlFor="forgot_email"
-                      className="block mb-2 text-sm font-medium text-white"
-                    >
-                      Your email
-                    </label>
-                    <input
-                      type="email"
-                      id="forgot_email"
-                      value={forgotEmail}
-                      onChange={(e) => setForgotEmail(e.target.value)}
-                      className="border py-2.5 px-3 sm:text-sm rounded-lg block w-full bg-white border-cyan-600 text-slate-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 shadow-inner"
-                      placeholder="your@email.com"
-                      required
-                    />
-                  </div>
+            <form onSubmit={handleForgotPassword} className="space-y-4">
+              <AuthField
+                type="email"
+                id="forgot_email"
+                value={forgotEmail}
+                onChange={e => setForgotEmail(e.target.value)}
+                placeholder="Email Address"
+                icon={<Mail className="w-[18px] h-[18px]" />}
+                required
+              />
 
-                  <button
-                    type="submit"
-                    disabled={forgotLoading}
-                    className="inline-block w-full px-6 py-3 font-bold text-center text-white uppercase align-middle transition-all bg-gradient-to-tl from-blue-600 to-cyan-400 hover:from-blue-700 hover:to-cyan-500 rounded-lg cursor-pointer shadow-lg text-xs tracking-wider disabled:opacity-70 active:scale-[0.99]"
-                  >
-                    {forgotLoading ? 'Sending Link...' : 'Send Reset Link'}
-                  </button>
+              <AuthSubmitButton id="forgot_submit" isLoading={forgotLoading} loadingLabel="Sending Link...">
+                Send Reset Link
+              </AuthSubmitButton>
 
-                  <div className="text-center pt-2 border-t border-sky-700/60">
-                    <button
-                      type="button"
-                      onClick={() => setView('signin')}
-                      className="inline-flex items-center text-xs sm:text-sm text-cyan-200 hover:text-white font-semibold hover:underline cursor-pointer focus:outline-none"
-                    >
-                      <ArrowLeft className="w-4 h-4 mr-1.5" />
-                      Back to Sign in
-                    </button>
-                  </div>
-                </form>
-              </div>
-            </div>
-          </section>
+              <button type="button" onClick={() => setView('signin')} className="w-full flex items-center justify-center space-x-2 text-sm font-semibold text-blue-600 hover:text-blue-700 hover:underline cursor-pointer py-1">
+                <ArrowLeft className="w-4 h-4" />
+                <span>Back to Sign In</span>
+              </button>
+            </form>
+          </div>
         )}
 
-        {/* SIGN UP VIEW */}
+        {/* ═══════════════ SIGN UP ═══════════════ */}
         {view === 'signup' && (
-          <section className="w-full flex flex-col items-center justify-center">
-            <a
-              href="#"
-              onClick={(e) => e.preventDefault()}
-              className="flex items-center mb-5 text-2xl font-semibold"
-            >
-              <div className="rounded-2xl w-16 h-16 sm:w-20 sm:h-20 overflow-hidden shadow-xl bg-white/10 p-1 backdrop-blur-xs">
-                <img
-                  src="/assets/img/sameduhub-logo-transparent.png"
-                  alt="SamEduHub Logo"
-                  className="w-full h-full object-contain"
-                />
-              </div>
-            </a>
+          <div className="w-full">
+            <AuthBrand className="mb-5" />
 
-            <div className="w-full rounded-2xl shadow-2xl border md:mt-0 sm:max-w-md xl:p-0 bg-sky-800 border-sky-700 backdrop-blur-md">
-              <div className="p-6 space-y-4 sm:p-8">
-                <div>
-                  <h2 className="text-xl font-bold leading-tight tracking-tight text-white md:text-2xl">
-                    Create SamEduHub Account
-                  </h2>
-                  <p className="text-xs text-cyan-200 mt-1">
-                    Join Nigeria's leading agent network for NIN, BVN, and bill payments.
-                  </p>
-                </div>
+            <h2 className="text-2xl font-extrabold text-slate-900 mb-1">Create Your Account</h2>
+            <p className="text-sm text-slate-500 mb-6">
+              Join SamEduHub and enjoy fast, secure and convenient access to all our digital services.
+            </p>
 
-                <form className="space-y-3.5" onSubmit={handleSignUp}>
-                  <div>
-                    <label className="block mb-1.5 text-xs font-medium text-white">Full Name</label>
-                    <input
-                      type="text"
-                      value={signupName}
-                      onChange={(e) => setSignupName(e.target.value)}
-                      className="border py-2 px-3 text-sm rounded-lg block w-full bg-white border-cyan-600 text-slate-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      placeholder="e.g. Ibrahim Abubakar"
-                      required
-                    />
-                  </div>
+            <form onSubmit={handleSignUp} className="space-y-4">
+              <AuthField
+                type="text"
+                id="signup_name"
+                value={signupName}
+                onChange={e => setSignupName(e.target.value)}
+                placeholder="Full Name"
+                icon={<UserRound className="w-[18px] h-[18px]" />}
+                required
+              />
+              <AuthField
+                type="email"
+                id="signup_email"
+                value={signupEmail}
+                onChange={e => setSignupEmail(e.target.value)}
+                placeholder="Email Address"
+                icon={<Mail className="w-[18px] h-[18px]" />}
+                required
+              />
+              <AuthField
+                type="tel"
+                id="signup_phone"
+                value={signupPhone}
+                onChange={e => setSignupPhone(e.target.value)}
+                placeholder="Phone Number"
+                icon={<Phone className="w-[18px] h-[18px]" />}
+                required
+              />
+              <AuthField
+                type="password"
+                id="signup_password"
+                value={signupPassword}
+                onChange={e => setSignupPassword(e.target.value)}
+                placeholder="Password"
+                icon={<LockKeyhole className="w-[18px] h-[18px]" />}
+                required
+              />
+              <AuthField
+                type="password"
+                id="signup_confirm"
+                value={signupConfirmPassword}
+                onChange={e => setSignupConfirmPassword(e.target.value)}
+                placeholder="Confirm Password"
+                icon={<LockKeyhole className="w-[18px] h-[18px]" />}
+                required
+              />
 
-                  <div>
-                    <label className="block mb-1.5 text-xs font-medium text-white">Phone Number</label>
-                    <input
-                      type="tel"
-                      value={signupPhone}
-                      onChange={(e) => setSignupPhone(e.target.value)}
-                      className="border py-2 px-3 text-sm rounded-lg block w-full bg-white border-cyan-600 text-slate-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      placeholder="08012345678"
-                      required
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block mb-1.5 text-xs font-medium text-white">Email Address</label>
-                    <input
-                      type="email"
-                      value={signupEmail}
-                      onChange={(e) => setSignupEmail(e.target.value)}
-                      className="border py-2 px-3 text-sm rounded-lg block w-full bg-white border-cyan-600 text-slate-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      placeholder="agent@example.com"
-                      required
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div>
-                      <label className="block mb-1.5 text-xs font-medium text-white">Password</label>
-                      <input
-                        type="password"
-                        value={signupPassword}
-                        onChange={(e) => setSignupPassword(e.target.value)}
-                        className="border py-2 px-3 text-sm rounded-lg block w-full bg-white border-cyan-600 text-slate-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                        placeholder="••••••••"
-                        required
-                      />
-                    </div>
-                    <div>
-                      <label className="block mb-1.5 text-xs font-medium text-white">Confirm</label>
-                      <input
-                        type="password"
-                        value={signupConfirmPassword}
-                        onChange={(e) => setSignupConfirmPassword(e.target.value)}
-                        className="border py-2 px-3 text-sm rounded-lg block w-full bg-white border-cyan-600 text-slate-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                        placeholder="••••••••"
-                        required
-                      />
-                    </div>
-                  </div>
-
-                  <button
-                    type="submit"
-                    className="w-full text-white bg-slate-900 hover:bg-slate-950 font-semibold rounded-lg text-sm px-5 py-2.5 mt-2 transition-all cursor-pointer shadow-lg active:scale-[0.99]"
-                  >
-                    Register as Agent
-                  </button>
-
-                  <div className="text-center pt-2 border-t border-sky-700/60">
-                    <p className="text-xs text-cyan-200">
-                      Already registered?{' '}
-                      <button
-                        type="button"
-                        onClick={() => setView('signin')}
-                        className="text-white font-bold hover:underline cursor-pointer"
-                      >
-                        Sign in here
-                      </button>
-                    </p>
-                  </div>
-                </form>
-              </div>
-            </div>
-          </section>
+              <AuthSubmitButton id="signup_submit" isLoading={isLoading} loadingLabel="Creating Account" className="mt-1">
+                Create Account
+              </AuthSubmitButton>
+              <AuthDivider />
+              <GoogleAuthButton id="google_signup" label="Continue with Google" onClick={() => showNotification('info', 'Google Sign-Up', 'Google OAuth coming soon!')} />
+              <AuthTerms action="creating an account" />
+            </form>
+          </div>
         )}
       </>
     );

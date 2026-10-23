@@ -1,8 +1,14 @@
 @import "tailwindcss";
 
+html {
+  scroll-behavior: smooth;
+}
+
 @layer base {
   body {
-    font-family: 'Nunito', sans-serif;
+    font-family: 'Plus Jakarta Sans', 'Inter', system-ui, -apple-system, sans-serif;
+    color: #1A1D20;
+    background-color: #FAF7F2;
   }
 }
 
