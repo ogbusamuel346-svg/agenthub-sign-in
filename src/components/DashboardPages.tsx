@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 import { auth } from '../firebase';
 import { updateProfile } from 'firebase/auth';
-import { describeApiError, getExamPurchaseHistory, getIntegrationHealth, getLiveDataPlans, getLiveElectricityProviders, getLiveExamProducts, getLiveNetworks, getTransactionStatus, getTransactions, purchaseAirtime, purchaseData, purchaseElectricity, verifyElectricityCustomer, type ExamPurchaseHistoryItem, type TopupmateExamProduct, type TopupmateNetwork, type TopupmatePlan, type TopupmateUtilityProvider } from '../services/smeApi';
+import { describeApiError, getExamPurchaseHistory, getIntegrationHealth, getLiveDataPlans, getLiveElectricityProviders, getLiveExamProducts, getLiveNetworks, getTransactionDelivery, getTransactionStatus, getTransactions, purchaseAirtime, purchaseData, purchaseElectricity, purchaseExamPin, verifyElectricityCustomer, type ExamPurchaseHistoryItem, type TopupmateExamProduct, type TopupmateNetwork, type TopupmatePlan, type TopupmateUtilityProvider } from '../services/smeApi';
 import { createWalletFunding, getWalletBalance, getWalletFundingStatus } from '../services/wallet';
 
 export type DashboardPageId =
@@ -178,6 +178,20 @@ function validNigerianPhone(value: string) {
   return /^0\d{10}$/.test(value.replace(/[\s-]/g, ''));
 }
 
+async function downloadTransactionDelivery(reference: string, service: string) {
+  const result = await getTransactionDelivery(reference);
+  const heading = service === 'electricity' ? 'Electricity token' : 'Exam PIN';
+  const body = [`SamEduHub ${heading}`, `Reference: ${result.reference}`, '', ...result.delivery].join('\r\n');
+  const blobUrl = URL.createObjectURL(new Blob([body], { type: 'text/plain;charset=utf-8' }));
+  const link = document.createElement('a');
+  link.href = blobUrl;
+  link.download = `sameduhub-${service}-${reference.replace(/[^a-z0-9_-]/gi, '-')}.txt`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+}
+
 function networkOptionsFromPlans(plans: TopupmatePlan[]) {
   const options = new Map<string, { value: string; label: string; id: string | number }>();
   for (const plan of plans) {
@@ -256,7 +270,11 @@ function ExamPinsPage({ onNavigate }: DashboardPageProps) {
   const [historyLoading, setHistoryLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [historyError, setHistoryError] = useState('');
-  const [selectedOrder, setSelectedOrder] = useState<ExamPurchaseHistoryItem | null>(null);
+  const [deliveryLoading, setDeliveryLoading] = useState('');
+  const [purchaseError, setPurchaseError] = useState('');
+  const [purchaseReady, setPurchaseReady] = useState(false);
+  const [purchasing, setPurchasing] = useState(false);
+  const [purchaseStatus, setPurchaseStatus] = useState<Status>(null);
   const selectedProduct = products.find(item => String(item.id) === product);
   const requestedQuantity = Number(quantity);
   const validQuantity = Number.isInteger(requestedQuantity) && requestedQuantity >= 1;
@@ -268,16 +286,44 @@ function ExamPinsPage({ onNavigate }: DashboardPageProps) {
       .then(response => { if (active) setProducts(response.products); })
       .catch(error => { if (active) setLoadError(describeApiError(error)); })
       .finally(() => { if (active) setLoading(false); });
+    getIntegrationHealth().then(health => {
+      if (active) setPurchaseReady(health.ok && health.supplier.purchaseEnabled && health.supplier.customerWalletConfigured && health.supplier.transactionStoreConfigured && health.supplier.serverAuthConfigured);
+    }).catch(() => { if (active) setPurchaseReady(false); });
     getExamPurchaseHistory()
-      .then(response => { if (active) setHistory(response.transactions); })
+      .then(response => { if (active) setHistory(response.transactions.filter(item => item.service === 'exam-pin')); })
       .catch(error => { if (active) setHistoryError(describeApiError(error)); })
       .finally(() => { if (active) setHistoryLoading(false); });
     return () => { active = false; };
   }, []);
 
+  const submitPurchase = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedProduct || !selectedProduct.available || !validQuantity) { setPurchaseError('Choose an available product and a valid quantity.'); return; }
+    if (!purchaseReady) { setPurchaseError('Purchases are not enabled for this environment yet. Your wallet has not been charged.'); return; }
+    setPurchaseError('');
+    setPurchaseStatus(null);
+    setPurchasing(true);
+    try {
+      const result = await purchaseExamPin({ provider: selectedProduct.id, quantity: requestedQuantity });
+      setPurchaseStatus({ type: result.status === 'successful' ? 'success' : 'info', title: result.status === 'successful' ? 'Exam PIN order confirmed' : 'Exam PIN order processing', message: result.status === 'successful' ? `Reference ${result.reference}. Download delivered PINs from your purchase history when available.` : `Reference ${result.reference} is awaiting supplier confirmation. Check its status before trying again.` });
+      const response = await getExamPurchaseHistory();
+      setHistory(response.transactions.filter(item => item.service === 'exam-pin'));
+    } catch (error) {
+      setPurchaseStatus({ type: 'error', title: 'Exam PIN purchase not submitted', message: describeApiError(error) });
+    } finally { setPurchasing(false); }
+  };
+
+  const downloadPins = async (item: ExamPurchaseHistoryItem) => {
+    setDeliveryLoading(item.reference);
+    setHistoryError('');
+    try { await downloadTransactionDelivery(item.reference, 'exam-pin'); }
+    catch (error) { setHistoryError(describeApiError(error)); }
+    finally { setDeliveryLoading(''); }
+  };
+
   return <PageFrame page="exam-pins" onNavigate={onNavigate}>
     <div className="grid gap-5 lg:grid-cols-[1.2fr_.9fr]">
-      <FormCard title="Select examination product" onSubmit={event => event.preventDefault()}>
+      <FormCard title="Select examination product" onSubmit={submitPurchase}>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Examination product" hint={loading ? 'Loading TopupMate products…' : 'Products and current prices come from TopupMate.'}>
             <select value={product} onChange={event => setProduct(event.target.value)} className={inputClass} disabled={loading || products.length === 0}>
@@ -289,8 +335,9 @@ function ExamPinsPage({ onNavigate }: DashboardPageProps) {
           </Field>
           <Field label="Quantity"><input type="number" min="1" step="1" value={quantity} onChange={event => setQuantity(event.target.value)} className={inputClass} disabled={loading || products.length === 0} /></Field>
         </div>
-        <p className="mt-4 text-xs text-[#6c82a4]">Exam PIN purchases are temporarily unavailable. Browsing products does not charge your wallet.</p>
-        <div className="mt-5"><SubmitButton disabled>Buy exam PINs — unavailable</SubmitButton></div>
+        <p className="mt-4 text-xs text-[#6c82a4]">You will be charged only after the server verifies the live product price and confirms sufficient wallet balance. PINs are available to download after supplier confirmation.</p>
+        {purchaseError && <p className="mt-4 text-xs font-semibold text-rose-600">{purchaseError}</p>}
+        <div className="mt-5"><SubmitButton disabled={purchasing || loading || !purchaseReady || !selectedProduct || !validQuantity}>{purchasing ? 'Submitting order…' : purchaseReady ? 'Buy exam PINs' : 'Purchases unavailable'}</SubmitButton></div>
       </FormCard>
       <div className="rounded-lg border border-[#d9e5f5] bg-white p-5 shadow-sm">
         <h2 className="mb-4 text-lg font-extrabold text-[#0c3275]">Order summary</h2>
@@ -300,10 +347,11 @@ function ExamPinsPage({ onNavigate }: DashboardPageProps) {
           Quantity: <strong>{validQuantity ? quantity : 'Enter a valid quantity'}</strong><br />
           Total: <strong>{selectedProduct?.price == null || !validQuantity ? 'Not provided' : money(selectedProduct.price * requestedQuantity)}</strong>
         </div>
-        <p className="mt-3 text-[11px] text-[#6c82a4]">PINs are shown only for saved purchases belonging to your account.</p>
+        <p className="mt-3 text-[11px] text-[#6c82a4]">PINs can be downloaded only from completed purchases belonging to your account.</p>
       </div>
     </div>
     {loadError && <StatusBanner status={{ type: 'error', title: 'TopupMate exam catalogue unavailable', message: loadError }} />}
+    <IntegrationNotice capability="exam PIN purchases and delivery" />
     <div className="rounded-lg border border-[#d9e5f5] bg-white p-5 shadow-sm">
       <h2 className="text-lg font-extrabold text-[#0c3275]">Purchase history</h2>
       {historyLoading ? <p className="mt-4 text-xs text-[#6c82a4]">Loading history…</p> : historyError ? <p className="mt-4 text-xs font-semibold text-rose-600">{historyError}</p> : history.length ?
@@ -313,13 +361,10 @@ function ExamPinsPage({ onNavigate }: DashboardPageProps) {
             <td className="px-3 py-3 font-bold text-[#173b79]">{item.product?.provider || item.providerName || 'Exam product'}</td>
             <td className="px-3 py-3">{item.quantity}</td><td className="px-3 py-3">{money(item.totalAmount)}</td>
             <td className="px-3 py-3">{item.status}</td><td className="px-3 py-3 font-mono">{item.reference}</td>
-            <td className="px-3 py-3">{item.pins?.length ? <button type="button" onClick={() => setSelectedOrder(item)} className="font-bold text-[#155EEF]">View delivery</button> : 'Awaiting delivery'}</td>
+            <td className="px-3 py-3">{item.hasDelivery ? <button type="button" disabled={deliveryLoading === item.reference} onClick={() => void downloadPins(item)} className="font-bold text-[#155EEF] disabled:opacity-50">{deliveryLoading === item.reference ? 'Preparing…' : 'Download PINs'}</button> : 'Awaiting delivery'}</td>
           </tr>)}</tbody>
         </table></div> : <p className="py-8 text-center text-sm text-[#6c82a4]">No exam-pin purchases yet.</p>}
-      {selectedOrder && <div className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-xs text-emerald-900">
-        <div className="flex items-center justify-between gap-4"><strong>Delivered PINs · {selectedOrder.reference}</strong><button type="button" onClick={() => setSelectedOrder(null)} className="font-bold">Hide</button></div>
-        <div className="mt-3 space-y-2 font-mono">{selectedOrder.pins.map((pin, index) => <p key={index} className="rounded bg-white/70 p-2">{pin}</p>)}</div>
-      </div>}
+      {purchaseStatus && <div className="mt-4"><StatusBanner status={purchaseStatus} /></div>}
     </div>
   </PageFrame>;
 }
@@ -334,6 +379,7 @@ function ElectricityPage({ onNavigate }: DashboardPageProps) {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [verifying, setVerifying] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [verifiedCustomer, setVerifiedCustomer] = useState(false);
   const [status, setStatus] = useState<Status>(null);
   const [error, setError] = useState('');
@@ -355,25 +401,27 @@ function ElectricityPage({ onNavigate }: DashboardPageProps) {
     try {
       await verifyElectricityCustomer({ provider: selectedProvider.id, meternumber: meterNumber.trim(), metertype: meterType as 'prepaid' | 'postpaid' });
       setVerifiedCustomer(true);
-      setStatus({ type: 'success', title: 'Meter verified', message: 'TopupMate verified the meter details. You can now review the electricity payment.' });
+      setStatus({ type: 'success', title: 'Meter verified', message: 'TopupMate verified the meter details. You can now submit the electricity payment.' });
     } catch (requestError) {
       setStatus({ type: 'error', title: 'Meter verification failed', message: describeApiError(requestError) });
     } finally { setVerifying(false); }
   };
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (submitting) return;
     if (!selectedProvider || !selectedProvider.available || !meterType || !meterNumber || !amount || !validNigerianPhone(phone) || Number(amount) <= 0) { setError('Complete the live provider, meter type, meter number, phone and a positive amount.'); return; }
     if (!verifiedCustomer) { setError('Verify the meter before submitting the electricity payment.'); return; }
     setError('');
+    setSubmitting(true);
     setStatus({ type: 'info', title: 'Submitting electricity payment', message: 'The authenticated payment request is being sent to TopupMate.' });
     try {
       const result = await purchaseElectricity({ provider: selectedProvider.id, metertype: meterType as 'prepaid' | 'postpaid', meternumber: meterNumber.trim(), amount: Number(amount), phone: phone.replace(/[\s-]/g, '') });
-      setStatus({ type: 'success', title: 'Electricity payment accepted', message: `Reference ${result.reference} is pending supplier confirmation.` });
+      setStatus({ type: result.status === 'successful' ? 'success' : 'info', title: result.status === 'successful' ? 'Electricity payment confirmed' : 'Electricity payment processing', message: result.status === 'successful' ? result.hasDelivery ? `Reference ${result.reference}. Download the token from transaction history.` : `Reference ${result.reference} is confirmed, but TopupMate has not returned the token yet. Check transaction history again shortly.` : `Reference ${result.reference} is awaiting supplier confirmation. Check its status before submitting again.` });
     } catch (requestError) {
       setStatus({ type: 'error', title: 'Electricity payment not submitted', message: describeApiError(requestError) });
-    }
+    } finally { setSubmitting(false); }
   };
-  return <PageFrame page="electricity" onNavigate={onNavigate}><div className="grid gap-5 lg:grid-cols-[1.35fr_.85fr]"><FormCard title="Meter and payment details" onSubmit={submit}><div className="grid gap-4 sm:grid-cols-2"><Field label="Distribution company" hint={loading ? 'Loading live TopupMate providers…' : loadError ? 'Live providers could not be loaded.' : 'Provider IDs come from the live TopupMate electricity catalogue.'}><select value={provider} onChange={e => { setProvider(e.target.value); setVerifiedCustomer(false); }} className={inputClass} disabled={loading || providers.length === 0}><option value="">{loading ? 'Loading providers…' : providers.length ? 'Select provider' : 'No live providers available'}</option>{providers.map(item => <option key={String(item.id)} value={String(item.id)} disabled={!item.available}>{item.name}{!item.available ? ' — unavailable' : ''}</option>)}</select></Field><Field label="Meter type"><select value={meterType} onChange={e => { setMeterType(e.target.value); setVerifiedCustomer(false); }} className={inputClass}><option value="">Select type</option><option value="prepaid">Prepaid</option><option value="postpaid">Postpaid</option></select></Field><Field label="Meter number"><input value={meterNumber} onChange={e => { setMeterNumber(e.target.value); setVerifiedCustomer(false); }} className={inputClass} placeholder="Enter meter number" inputMode="numeric" /></Field><Field label="Phone number"><input value={phone} onChange={e => setPhone(e.target.value)} className={inputClass} placeholder="080..." inputMode="tel" /></Field><Field label="Amount"><input value={amount} onChange={e => setAmount(e.target.value)} className={inputClass} placeholder="Enter amount" inputMode="decimal" /></Field></div><button type="button" onClick={() => void verifyCustomer()} disabled={verifying || loading || !selectedProvider} className="mt-5 rounded-lg border border-[#155EEF] px-4 py-2.5 text-xs font-extrabold text-[#155EEF] transition hover:bg-[#edf3ff] disabled:cursor-not-allowed disabled:opacity-60">{verifying ? 'Verifying…' : 'Verify customer'}</button>{error && <p className="mt-4 text-xs font-semibold text-rose-600">{error}</p>}<div className="mt-5"><SubmitButton disabled={verifying || loading || !selectedProvider}>{'Review payment'}</SubmitButton></div></FormCard><div className="space-y-5"><div className="rounded-lg border border-[#d9e5f5] bg-white p-5 shadow-sm"><h2 className="mb-4 text-lg font-extrabold text-[#0c3275]">Payment confirmation</h2><dl className="space-y-3 text-xs"><div className="flex justify-between gap-4"><dt className="text-[#6c82a4]">Provider</dt><dd className="font-bold text-[#173b79]">{selectedProvider?.name || 'Not selected'}</dd></div><div className="flex justify-between gap-4"><dt className="text-[#6c82a4]">Meter</dt><dd className="font-bold text-[#173b79]">{meterNumber || 'Not entered'}</dd></div><div className="flex justify-between gap-4"><dt className="text-[#6c82a4]">Customer</dt><dd className={`font-bold ${verifiedCustomer ? 'text-emerald-600' : 'text-amber-700'}`}>{verifiedCustomer ? 'Verified by TopupMate' : 'Not verified'}</dd></div></dl></div>{loadError && <StatusBanner status={{ type: 'error', title: 'Live electricity providers unavailable', message: loadError }} />}<IntegrationNotice capability="meter verification, electricity tokens and payments" /></div></div><StatusBanner status={status} /></PageFrame>;
+  return <PageFrame page="electricity" onNavigate={onNavigate}><div className="grid gap-5 lg:grid-cols-[1.35fr_.85fr]"><FormCard title="Meter and payment details" onSubmit={submit}><div className="grid gap-4 sm:grid-cols-2"><Field label="Distribution company" hint={loading ? 'Loading live TopupMate providers…' : loadError ? 'Live providers could not be loaded.' : 'Provider IDs come from the live TopupMate electricity catalogue.'}><select value={provider} onChange={e => { setProvider(e.target.value); setVerifiedCustomer(false); }} className={inputClass} disabled={loading || providers.length === 0}><option value="">{loading ? 'Loading providers…' : providers.length ? 'Select provider' : 'No live providers available'}</option>{providers.map(item => <option key={String(item.id)} value={String(item.id)} disabled={!item.available}>{item.name}{!item.available ? ' — unavailable' : ''}</option>)}</select></Field><Field label="Meter type"><select value={meterType} onChange={e => { setMeterType(e.target.value); setVerifiedCustomer(false); }} className={inputClass}><option value="">Select type</option><option value="prepaid">Prepaid</option><option value="postpaid">Postpaid</option></select></Field><Field label="Meter number"><input value={meterNumber} onChange={e => { setMeterNumber(e.target.value); setVerifiedCustomer(false); }} className={inputClass} placeholder="Enter meter number" inputMode="numeric" /></Field><Field label="Phone number"><input value={phone} onChange={e => setPhone(e.target.value)} className={inputClass} placeholder="080..." inputMode="tel" /></Field><Field label="Amount"><input value={amount} onChange={e => setAmount(e.target.value)} className={inputClass} placeholder="Enter amount" inputMode="decimal" /></Field></div><button type="button" onClick={() => void verifyCustomer()} disabled={verifying || submitting || loading || !selectedProvider} className="mt-5 rounded-lg border border-[#155EEF] px-4 py-2.5 text-xs font-extrabold text-[#155EEF] transition hover:bg-[#edf3ff] disabled:cursor-not-allowed disabled:opacity-60">{verifying ? 'Verifying…' : 'Verify customer'}</button>{error && <p className="mt-4 text-xs font-semibold text-rose-600">{error}</p>}<div className="mt-5"><SubmitButton disabled={verifying || submitting || loading || !selectedProvider || !verifiedCustomer || !amount || Number(amount) <= 0}>{submitting ? 'Sending payment…' : 'Pay electricity bill'}</SubmitButton></div></FormCard><div className="space-y-5"><div className="rounded-lg border border-[#d9e5f5] bg-white p-5 shadow-sm"><h2 className="mb-4 text-lg font-extrabold text-[#0c3275]">Payment confirmation</h2><dl className="space-y-3 text-xs"><div className="flex justify-between gap-4"><dt className="text-[#6c82a4]">Provider</dt><dd className="font-bold text-[#173b79]">{selectedProvider?.name || 'Not selected'}</dd></div><div className="flex justify-between gap-4"><dt className="text-[#6c82a4]">Meter</dt><dd className="font-bold text-[#173b79]">{meterNumber || 'Not entered'}</dd></div><div className="flex justify-between gap-4"><dt className="text-[#6c82a4]">Customer</dt><dd className={`font-bold ${verifiedCustomer ? 'text-emerald-600' : 'text-amber-700'}`}>{verifiedCustomer ? 'Verified by TopupMate' : 'Not verified'}</dd></div></dl></div>{loadError && <StatusBanner status={{ type: 'error', title: 'Live electricity providers unavailable', message: loadError }} />}<IntegrationNotice capability="meter verification, electricity tokens and payments" /></div></div><StatusBanner status={status} /></PageFrame>;
 }
 
 function WalletPage({ onNavigate }: DashboardPageProps) {
@@ -450,6 +498,7 @@ function TransactionsPage({ onNavigate }: DashboardPageProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [refreshing, setRefreshing] = useState('');
+  const [deliveryLoading, setDeliveryLoading] = useState('');
 
   useEffect(() => {
     let active = true;
@@ -489,7 +538,15 @@ function TransactionsPage({ onNavigate }: DashboardPageProps) {
     } finally { setRefreshing(''); }
   };
 
-  return <PageFrame page="transactions" onNavigate={onNavigate}><div className="rounded-lg border border-[#d9e5f5] bg-white p-5 shadow-sm"><div className="flex flex-col gap-4 border-b border-[#edf2f8] pb-5 lg:flex-row lg:items-end lg:justify-between"><Field label="Search reference or service"><div className="relative"><Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#7890b2]" /><input value={search} onChange={e => setSearch(e.target.value)} className={`${inputClass} pl-9`} placeholder="Search transactions" /></div></Field><Field label="Status"><select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} className={inputClass}><option value="all">All statuses</option><option value="completed">Completed</option><option value="pending">Pending</option><option value="failed">Failed</option></select></Field></div>{error && <p className="mt-4 text-xs font-semibold text-rose-600">{error}</p>}{loading ? <div className="py-14 text-center text-sm text-[#6c82a4]">Loading transaction history…</div> : visibleTransactions.length ? <div className="mt-5 overflow-x-auto"><table className="w-full min-w-[760px] text-left text-xs"><thead className="border-b border-[#edf2f8] text-[#6c82a4]"><tr><th className="px-3 py-3 font-bold">Service</th><th className="px-3 py-3 font-bold">Amount</th><th className="px-3 py-3 font-bold">Status</th><th className="px-3 py-3 font-bold">Reference</th><th className="px-3 py-3 font-bold">Action</th></tr></thead><tbody>{visibleTransactions.map(transaction => <tr key={transaction.reference} className="border-b border-[#f1f5fa] last:border-0"><td className="px-3 py-3 font-bold text-[#173b79]">{transaction.kind === 'wallet_funding' ? 'Wallet top-up' : transaction.product?.provider || transaction.providerName || 'Exam PIN'}</td><td className="px-3 py-3 text-[#456694]">₦{transaction.totalAmount.toLocaleString()}</td><td className={`px-3 py-3 font-bold ${transaction.status === 'successful' ? 'text-emerald-600' : transaction.status === 'failed' ? 'text-rose-600' : 'text-amber-700'}`}>{transaction.kind === 'wallet_funding' && transaction.status === 'successful' ? 'Credited' : transaction.status}</td><td className="px-3 py-3 font-mono text-[10px] text-[#456694]">{transaction.reference}</td><td className="px-3 py-3">{transaction.status === 'pending' || transaction.status === 'processing' ? <button type="button" onClick={() => void refresh(transaction.reference)} disabled={refreshing === transaction.reference} className="font-bold text-[#155EEF] hover:underline disabled:opacity-50">{refreshing === transaction.reference ? 'Checking…' : 'Check status'}</button> : <span className="text-[#9aaecb]">Final</span>}</td></tr>)}</tbody></table></div> : <div className="flex flex-col items-center justify-center py-14 text-center"><FileText className="h-12 w-12 text-[#9bb5df]" /><h2 className="mt-4 text-lg font-extrabold text-[#0c3275]">No transactions found</h2><p className="mt-2 max-w-md text-sm text-[#6c82a4]">Your authenticated wallet top-ups and service purchases are shown here. No rows or statuses are fabricated.</p><div className="mt-5 flex flex-wrap justify-center gap-3"><button type="button" onClick={() => onNavigate('wallet')} className="rounded-lg bg-[#155EEF] px-4 py-2.5 text-xs font-extrabold text-white">Open wallet</button><button type="button" onClick={() => onNavigate('support')} className="rounded-lg border border-[#155EEF] px-4 py-2.5 text-xs font-extrabold text-[#155EEF]">Contact support</button></div></div>}</div></PageFrame>;
+  const downloadDelivery = async (transaction: ExamPurchaseHistoryItem) => {
+    setDeliveryLoading(transaction.reference);
+    setError('');
+    try { await downloadTransactionDelivery(transaction.reference, transaction.service || 'exam-pin'); }
+    catch (downloadError) { setError(describeApiError(downloadError)); }
+    finally { setDeliveryLoading(''); }
+  };
+
+  return <PageFrame page="transactions" onNavigate={onNavigate}><div className="rounded-lg border border-[#d9e5f5] bg-white p-5 shadow-sm"><div className="flex flex-col gap-4 border-b border-[#edf2f8] pb-5 lg:flex-row lg:items-end lg:justify-between"><Field label="Search reference or service"><div className="relative"><Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#7890b2]" /><input value={search} onChange={e => setSearch(e.target.value)} className={`${inputClass} pl-9`} placeholder="Search transactions" /></div></Field><Field label="Status"><select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} className={inputClass}><option value="all">All statuses</option><option value="completed">Completed</option><option value="pending">Pending</option><option value="failed">Failed</option></select></Field></div>{error && <p className="mt-4 text-xs font-semibold text-rose-600">{error}</p>}{loading ? <div className="py-14 text-center text-sm text-[#6c82a4]">Loading transaction history…</div> : visibleTransactions.length ? <div className="mt-5 overflow-x-auto"><table className="w-full min-w-[760px] text-left text-xs"><thead className="border-b border-[#edf2f8] text-[#6c82a4]"><tr><th className="px-3 py-3 font-bold">Service</th><th className="px-3 py-3 font-bold">Amount</th><th className="px-3 py-3 font-bold">Status</th><th className="px-3 py-3 font-bold">Reference</th><th className="px-3 py-3 font-bold">Action</th></tr></thead><tbody>{visibleTransactions.map(transaction => <tr key={transaction.reference} className="border-b border-[#f1f5fa] last:border-0"><td className="px-3 py-3 font-bold text-[#173b79]">{transaction.kind === 'wallet_funding' ? 'Wallet top-up' : transaction.service === 'electricity' ? 'Electricity token' : transaction.product?.provider || transaction.providerName || 'Exam PIN'}</td><td className="px-3 py-3 text-[#456694]">₦{transaction.totalAmount.toLocaleString()}</td><td className={`px-3 py-3 font-bold ${transaction.status === 'successful' ? 'text-emerald-600' : transaction.status === 'failed' ? 'text-rose-600' : 'text-amber-700'}`}>{transaction.kind === 'wallet_funding' && transaction.status === 'successful' ? 'Credited' : transaction.status}</td><td className="px-3 py-3 font-mono text-[10px] text-[#456694]">{transaction.reference}</td><td className="px-3 py-3">{transaction.hasDelivery ? <button type="button" onClick={() => void downloadDelivery(transaction)} disabled={deliveryLoading === transaction.reference} className="font-bold text-[#155EEF] hover:underline disabled:opacity-50">{deliveryLoading === transaction.reference ? 'Preparing…' : transaction.service === 'electricity' ? 'Download token' : 'Download PINs'}</button> : (transaction.status === 'pending' || transaction.status === 'processing' || (transaction.service === 'electricity' && transaction.status === 'successful')) ? <button type="button" onClick={() => void refresh(transaction.reference)} disabled={refreshing === transaction.reference} className="font-bold text-[#155EEF] hover:underline disabled:opacity-50">{refreshing === transaction.reference ? 'Checking…' : transaction.service === 'electricity' && transaction.status === 'successful' ? 'Check token' : 'Check status'}</button> : <span className="text-[#9aaecb]">Final</span>}</td></tr>)}</tbody></table></div> : <div className="flex flex-col items-center justify-center py-14 text-center"><FileText className="h-12 w-12 text-[#9bb5df]" /><h2 className="mt-4 text-lg font-extrabold text-[#0c3275]">No transactions found</h2><p className="mt-2 max-w-md text-sm text-[#6c82a4]">Your authenticated wallet top-ups and service purchases are shown here. No rows or statuses are fabricated.</p><div className="mt-5 flex flex-wrap justify-center gap-3"><button type="button" onClick={() => onNavigate('wallet')} className="rounded-lg bg-[#155EEF] px-4 py-2.5 text-xs font-extrabold text-white">Open wallet</button><button type="button" onClick={() => onNavigate('support')} className="rounded-lg border border-[#155EEF] px-4 py-2.5 text-xs font-extrabold text-[#155EEF]">Contact support</button></div></div>}</div></PageFrame>;
 }
 
 function ProfilePage({ currentUser, onNavigate, onProfileUpdated }: DashboardPageProps) {

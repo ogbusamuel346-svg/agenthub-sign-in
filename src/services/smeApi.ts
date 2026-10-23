@@ -39,11 +39,14 @@ export type ExamPurchase = {
   quantity: number;
   unitPrice: number;
   totalAmount: number;
-  pins: string[];
+  pins?: string[];
+  hasDelivery?: boolean;
   message: string;
 };
 
-export type ExamPurchaseHistoryItem = ExamPurchase & {
+export type ExamPurchaseHistoryItem = Omit<ExamPurchase, 'pins'> & {
+  pins?: string[];
+  hasDelivery?: boolean;
   kind?: 'service_purchase' | 'wallet_funding';
   service?: string;
   product?: { id: string | number; provider: string };
@@ -167,7 +170,39 @@ export function verifyElectricityCustomer(input: { provider: string | number; me
 }
 
 export function purchaseElectricity(input: { provider: string | number; metertype: 'prepaid' | 'postpaid'; meternumber: string; amount: number; phone: string }) {
-  return request<{ reference: string; status: string }>('electricity', { method: 'POST', body: JSON.stringify(input) }, true);
+  const ref = getElectricityPurchaseReference(input);
+  const result = import.meta.env.VITE_CLOUDFLARE_API === 'true'
+    ? apiRequest<{ reference: string; status: string; hasDelivery?: boolean; message: string }>('/api/cloudflare/services/electricity/purchase', { method: 'POST', body: JSON.stringify({ ...input, ref }) }, { authenticated: true })
+    : request<{ reference: string; status: string; hasDelivery?: boolean; message: string }>('electricity', { method: 'POST', body: JSON.stringify({ ...input, ref }) }, true);
+  return result.then((purchase) => {
+    if (purchase.status === 'successful' || purchase.status === 'failed') {
+      try { sessionStorage.removeItem(electricityPurchaseAttemptKey); } catch { /* session storage may be unavailable */ }
+    }
+    return purchase;
+  }).catch((error: unknown) => {
+    if (error instanceof ApiClientError && (error.status === 409 || error.code === 'TOPUPMATE_PURCHASE_FAILED')) {
+      try { sessionStorage.removeItem(electricityPurchaseAttemptKey); } catch { /* session storage may be unavailable */ }
+    }
+    throw error;
+  });
+}
+
+const electricityPurchaseAttemptKey = 'sameduhub:electricity-purchase-attempt';
+
+function getElectricityPurchaseReference(input: { provider: string | number; metertype: 'prepaid' | 'postpaid'; meternumber: string; amount: number; phone: string }) {
+  const fingerprint = `${input.provider}:${input.metertype}:${input.meternumber}:${input.amount}:${input.phone}`;
+  try {
+    const saved = sessionStorage.getItem(electricityPurchaseAttemptKey);
+    if (saved) {
+      const attempt = JSON.parse(saved) as { fingerprint?: unknown; reference?: unknown };
+      if (attempt.fingerprint === fingerprint && typeof attempt.reference === 'string') return attempt.reference;
+    }
+    const reference = `electricity-${crypto.randomUUID()}`;
+    sessionStorage.setItem(electricityPurchaseAttemptKey, JSON.stringify({ fingerprint, reference }));
+    return reference;
+  } catch {
+    return `electricity-${crypto.randomUUID()}`;
+  }
 }
 
 const examPurchaseAttemptKey = 'sameduhub:exam-purchase-attempt';
@@ -190,9 +225,17 @@ function getExamPurchaseReference(input: { provider: string | number; quantity: 
 
 export async function purchaseExamPin(input: { provider: string | number; quantity: number }) {
   const ref = getExamPurchaseReference(input);
-  const result = import.meta.env.VITE_CLOUDFLARE_API === 'true'
-    ? await apiRequest<ExamPurchase>('/api/cloudflare/services/exam/purchase', { method: 'POST', body: JSON.stringify({ ...input, ref }) }, { authenticated: true })
-    : await request<ExamPurchase>('exam', { method: 'POST', body: JSON.stringify({ ...input, ref }) }, true);
+  let result: ExamPurchase;
+  try {
+    result = import.meta.env.VITE_CLOUDFLARE_API === 'true'
+      ? await apiRequest<ExamPurchase>('/api/cloudflare/services/exam/purchase', { method: 'POST', body: JSON.stringify({ ...input, ref }) }, { authenticated: true })
+      : await request<ExamPurchase>('exam', { method: 'POST', body: JSON.stringify({ ...input, ref }) }, true);
+  } catch (error) {
+    if (error instanceof ApiClientError && (error.status === 409 || error.code === 'TOPUPMATE_PURCHASE_FAILED')) {
+      try { sessionStorage.removeItem(examPurchaseAttemptKey); } catch { /* session storage may be unavailable */ }
+    }
+    throw error;
+  }
   if (result.status === 'successful' || result.status === 'failed') {
     try { sessionStorage.removeItem(examPurchaseAttemptKey); } catch { /* session storage may be unavailable */ }
   }
@@ -203,14 +246,29 @@ export function getExamPurchaseHistory() {
   if (import.meta.env.VITE_CLOUDFLARE_API === 'true') {
     return apiRequest<{ transactions: ExamPurchaseHistoryItem[] }>('/api/cloudflare/transactions', undefined, { authenticated: true });
   }
-  return request<{ transactions: ExamPurchaseHistoryItem[] }>('exam/history', undefined, true);
+  return request<{ transactions: ExamPurchaseHistoryItem[] }>('exam/history', undefined, true).then(result => ({
+    transactions: result.transactions.map(transaction => ({ ...transaction, hasDelivery: transaction.status === 'successful' && Boolean(transaction.pins?.length) })),
+  }));
 }
 
 export function getTransactions() {
   if (import.meta.env.VITE_CLOUDFLARE_API === 'true') {
     return apiRequest<{ transactions: ExamPurchaseHistoryItem[] }>('/api/cloudflare/transactions', undefined, { authenticated: true });
   }
-  return request<{ transactions: ExamPurchaseHistoryItem[] }>('transactions', undefined, true);
+  return request<{ transactions: ExamPurchaseHistoryItem[] }>('transactions', undefined, true).then(result => ({
+    transactions: result.transactions.map(transaction => ({ ...transaction, hasDelivery: transaction.status === 'successful' && Boolean(transaction.pins?.length) })),
+  }));
+}
+
+export function getTransactionDelivery(reference: string) {
+  if (import.meta.env.VITE_CLOUDFLARE_API === 'true') {
+    return apiRequest<{ reference: string; service: string; delivery: string[] }>(`/api/cloudflare/transactions/${encodeURIComponent(reference)}/delivery`, undefined, { authenticated: true });
+  }
+  return getExamPurchaseHistory().then(({ transactions }) => {
+    const transaction = transactions.find(item => item.reference === reference);
+    if (transaction?.status !== 'successful' || !transaction.pins?.length) throw new TopupmateClientError('The supplier has not delivered PINs for this transaction.', 409, 'DELIVERY_NOT_READY');
+    return { reference, service: 'exam-pin', delivery: transaction.pins };
+  });
 }
 
 export function getTransactionStatus(reference: string) {

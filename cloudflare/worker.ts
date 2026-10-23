@@ -193,9 +193,10 @@ async function getD1TransactionStatus(request: Request, env: Env) {
     if (providerStatus === 'unknown') return json({ error: { code: 'TOPUPMATE_INVALID_RESPONSE', message: 'TopupMate returned an unrecognized transaction status.' } }, 502);
     let status = String(record.status);
     const now = Date.now();
+    const delivery = collectPins(supplier);
     if (providerStatus === 'successful' && status !== 'failed') {
       status = 'successful';
-      await env.DB.prepare("UPDATE service_transactions SET status='successful', provider_status=?, updated_at=? WHERE user_id=? AND reference=? AND status<>'failed'").bind(providerStatus, now, auth.user.uid, reference).run();
+      await env.DB.prepare("UPDATE service_transactions SET status='successful', provider_status=?, pins_json=COALESCE(?, pins_json), updated_at=? WHERE user_id=? AND reference=? AND status<>'failed'").bind(providerStatus, delivery.length ? JSON.stringify(delivery) : null, now, auth.user.uid, reference).run();
     } else if (providerStatus === 'failed' && status !== 'successful') {
       const refundRequest = new Request(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify({ reference, failureCode: 'TOPUPMATE_PURCHASE_FAILED' }) });
       await refundD1Service(refundRequest, env);
@@ -204,7 +205,9 @@ async function getD1TransactionStatus(request: Request, env: Env) {
       status = 'pending';
       await env.DB.prepare("UPDATE service_transactions SET status='pending', provider_status=?, updated_at=? WHERE user_id=? AND reference=? AND status='processing'").bind(providerStatus, now, auth.user.uid, reference).run();
     }
-    const transaction = { reference, service: record.service, product: { id: record.provider_id, provider: record.provider_name }, providerId: record.provider_id, providerName: record.provider_name, quantity: record.quantity, unitPrice: Number(record.unit_price_minor) / 100, totalAmount: Number(record.total_amount_minor) / 100, currency: record.currency, status, providerStatus, pins: record.pins_json ? JSON.parse(String(record.pins_json)) : [], failureCode: record.failure_code || null, createdAt: record.created_at, updatedAt: now, debitedAt: record.debited_at || null, refundedAt: record.refunded_at || null };
+    let savedDelivery: unknown = [];
+    try { savedDelivery = record.pins_json ? JSON.parse(String(record.pins_json)) : []; } catch { savedDelivery = []; }
+    const transaction = { reference, service: record.service, product: { id: record.provider_id, provider: record.provider_name }, providerId: record.provider_id, providerName: record.provider_name, quantity: record.quantity, unitPrice: Number(record.unit_price_minor) / 100, totalAmount: Number(record.total_amount_minor) / 100, currency: record.currency, status, providerStatus, hasDelivery: status === 'successful' && ((Array.isArray(savedDelivery) && savedDelivery.length > 0) || delivery.length > 0), failureCode: record.failure_code || null, createdAt: record.created_at, updatedAt: now, debitedAt: record.debited_at || null, refundedAt: record.refunded_at || null };
     return json({ reference, status, providerStatus, transaction, checkedAt: new Date().toISOString() });
   } catch {
     return json({ error: { code: 'TOPUPMATE_STATUS_UNAVAILABLE', message: 'The transaction status could not be reconciled.' } }, 502);
@@ -225,7 +228,7 @@ async function listD1Transactions(request: Request, env: Env) {
     providerId: row.provider_id, providerName: row.provider_name, quantity: row.quantity,
     unitPrice: Number(row.unit_price_minor) / 100, totalAmount: Number(row.total_amount_minor) / 100,
     currency: row.currency, status: row.status, providerStatus: row.provider_status || null,
-    pins: row.pins_json ? JSON.parse(String(row.pins_json)) : [], failureCode: row.failure_code || null,
+    hasDelivery: ['exam-pin', 'electricity'].includes(String(row.service)) && row.status === 'successful' && Boolean(row.pins_json && (() => { try { const values = JSON.parse(String(row.pins_json)); return Array.isArray(values) && values.length > 0; } catch { return false; } })()), failureCode: row.failure_code || null,
     createdAt: row.created_at, updatedAt: row.updated_at, debitedAt: row.debited_at || null, refundedAt: row.refunded_at || null,
   }));
   const fundingTransactions = fundingResult.results.map(row => ({
@@ -254,6 +257,21 @@ async function listD1Transactions(request: Request, env: Env) {
     .sort((a, b) => Number(b.createdAt) - Number(a.createdAt))
     .slice(0, 50);
   return json({ transactions });
+}
+
+async function getD1TransactionDelivery(request: Request, env: Env, reference: string) {
+  const auth = await requireUser(request, env);
+  if (!auth.user) return auth.response!;
+  if (!/^[a-z0-9][a-z0-9_.:-]{5,120}$/i.test(reference)) return json({ error: { code: 'INVALID_REQUEST', message: 'A valid transaction reference is required.' } }, 400);
+  const record = await env.DB.prepare('SELECT service, status, pins_json FROM service_transactions WHERE user_id=? AND reference=?').bind(auth.user.uid, reference).first<{ service: string; status: string; pins_json: string | null }>();
+  if (!record) return json({ error: { code: 'TRANSACTION_NOT_FOUND', message: 'No transaction with this reference belongs to your account.' } }, 404);
+  if (!['exam-pin', 'electricity'].includes(record.service)) return json({ error: { code: 'DELIVERY_NOT_SUPPORTED', message: 'This transaction does not have a downloadable product.' } }, 409);
+  if (record.status !== 'successful') return json({ error: { code: 'DELIVERY_NOT_READY', message: 'The supplier has not confirmed this transaction yet.' } }, 409);
+  let values: unknown;
+  try { values = record.pins_json ? JSON.parse(record.pins_json) : []; } catch { values = []; }
+  const delivery = Array.isArray(values) ? values.filter((value): value is string => typeof value === 'string' && Boolean(value.trim())).map(value => value.trim()) : [];
+  if (!delivery.length) return json({ error: { code: 'DELIVERY_NOT_READY', message: 'The supplier has not returned a PIN or token for this transaction yet.' } }, 409);
+  return json({ reference, service: record.service, delivery });
 }
 
 function requireEnv(env: Env, key: keyof Env) {
@@ -514,8 +532,10 @@ async function purchaseD1ExamPin(request: Request, env: Env) {
   const existing = await env.DB.prepare('SELECT service, provider_id, provider_name, quantity, unit_price_minor, total_amount_minor, status, pins_json FROM service_transactions WHERE user_id=? AND reference=?').bind(auth.user.uid, reference).first<Record<string, unknown>>();
   if (existing) {
     if (existing.service !== 'exam-pin' || String(existing.provider_id) !== providerId || Number(existing.quantity) !== quantity) return json({ error: { code: 'REFERENCE_CONFLICT', message: 'This order reference belongs to another purchase.' } }, 409);
-    const pins = existing.pins_json ? JSON.parse(String(existing.pins_json)) : [];
-    return json({ reference, status: existing.status === 'successful' ? 'successful' : 'pending', product: { id: existing.provider_id, provider: existing.provider_name }, quantity, unitPrice: Number(existing.unit_price_minor) / 100, totalAmount: Number(existing.total_amount_minor) / 100, pins, message: 'This order reference has already been recorded.' }, existing.status === 'successful' ? 200 : 202);
+    if (existing.status === 'failed') return json({ error: { code: 'PREVIOUS_ORDER_FAILED', message: 'This order failed and its wallet debit was refunded. Start a new order.' } }, 409);
+    let delivery: unknown = [];
+    try { delivery = existing.pins_json ? JSON.parse(String(existing.pins_json)) : []; } catch { delivery = []; }
+    return json({ reference, status: existing.status === 'successful' ? 'successful' : 'pending', product: { id: existing.provider_id, provider: existing.provider_name }, quantity, unitPrice: Number(existing.unit_price_minor) / 100, totalAmount: Number(existing.total_amount_minor) / 100, hasDelivery: existing.status === 'successful' && Array.isArray(delivery) && delivery.length > 0, message: 'This order reference has already been recorded.' }, existing.status === 'successful' ? 200 : 202);
   }
   const now = Date.now();
   const entryId = `debit:${crypto.randomUUID()}`;
@@ -530,7 +550,7 @@ async function purchaseD1ExamPin(request: Request, env: Env) {
     supplier = await topupmateRequest(env, '/exampin/', 'POST', { provider: product.id, quantity, ref: reference });
   } catch {
     await env.DB.prepare("UPDATE service_transactions SET status='pending',failure_code='SUPPLIER_OUTCOME_UNCERTAIN',updated_at=? WHERE user_id=? AND reference=? AND status='processing'").bind(Date.now(), auth.user.uid, reference).run();
-    return json({ reference, status: 'pending', product: { id: product.id, provider: product.provider }, quantity, unitPrice: product.price, totalAmount: product.price * quantity, pins: [], message: 'Your order is awaiting confirmation. Check its status before purchasing again.' }, 202);
+    return json({ reference, status: 'pending', product: { id: product.id, provider: product.provider }, quantity, unitPrice: product.price, totalAmount: product.price * quantity, hasDelivery: false, message: 'Your order is awaiting confirmation. Check its status before purchasing again.' }, 202);
   }
   const providerStatus = getSupplierTransactionStatus(supplier);
   if (providerStatus === 'failed') {
@@ -546,7 +566,7 @@ async function purchaseD1ExamPin(request: Request, env: Env) {
   const pins = collectPins(supplier);
   const status = providerStatus === 'successful' ? 'successful' : 'pending';
   await env.DB.prepare('UPDATE service_transactions SET status=?,provider_status=?,pins_json=?,updated_at=? WHERE user_id=? AND reference=?').bind(status, providerStatus, JSON.stringify(pins), Date.now(), auth.user.uid, reference).run();
-  return json({ reference, status, product: { id: product.id, provider: product.provider }, quantity, unitPrice: product.price, totalAmount: product.price * quantity, pins, message: pins.length ? 'Exam PINs were delivered by TopupMate.' : 'Your exam order is awaiting confirmation.' }, status === 'successful' ? 200 : 202);
+  return json({ reference, status, product: { id: product.id, provider: product.provider }, quantity, unitPrice: product.price, totalAmount: product.price * quantity, hasDelivery: status === 'successful' && pins.length > 0, message: pins.length ? 'Exam PINs were delivered by TopupMate.' : 'Your exam order is awaiting confirmation.' }, status === 'successful' ? 200 : 202);
 }
 
 async function purchaseD1Airtime(request: Request, env: Env) {
@@ -604,6 +624,69 @@ async function purchaseD1Airtime(request: Request, env: Env) {
   const status = providerStatus === 'successful' ? 'successful' : 'pending';
   await env.DB.prepare('UPDATE service_transactions SET status=?,provider_status=?,updated_at=? WHERE user_id=? AND reference=?').bind(status, providerStatus, Date.now(), auth.user.uid, reference).run();
   return json({ reference, status, network: { id: networkId, name: network.name }, amount, message: status === 'successful' ? 'Airtime delivery was confirmed by the supplier.' : 'Your airtime request is awaiting supplier confirmation.' }, status === 'successful' ? 200 : 202);
+}
+
+async function purchaseD1Electricity(request: Request, env: Env) {
+  const auth = await requireUser(request, env);
+  if (!auth.user) return auth.response!;
+  if (!livePurchasesReady(env)) return json({ error: { code: 'ELECTRICITY_PURCHASES_DISABLED', message: 'Electricity purchases are temporarily unavailable. Your wallet has not been charged.' } }, 503);
+  const body = await request.json().catch(() => null) as { provider?: unknown; metertype?: unknown; meternumber?: unknown; amount?: unknown; phone?: unknown; ref?: unknown } | null;
+  const providerId = typeof body?.provider === 'string' || typeof body?.provider === 'number' ? String(body.provider).trim() : '';
+  const meterType = typeof body?.metertype === 'string' ? body.metertype.trim().toLowerCase() : '';
+  const meterNumber = typeof body?.meternumber === 'string' ? body.meternumber.trim() : '';
+  const phone = typeof body?.phone === 'string' ? body.phone.replace(/[\s-]/g, '') : '';
+  const amount = typeof body?.amount === 'number' ? body.amount : typeof body?.amount === 'string' ? Number(body.amount) : NaN;
+  const reference = typeof body?.ref === 'string' ? body.ref.trim() : '';
+  if (!providerId || !['prepaid', 'postpaid'].includes(meterType) || meterNumber.length < 4 || meterNumber.length > 40 || !Number.isFinite(amount) || amount <= 0 || !Number.isSafeInteger(Math.round(amount * 100)) || Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-7 || !/^0\d{10}$/.test(phone) || !/^[a-z0-9][a-z0-9_.:-]{5,120}$/i.test(reference)) {
+    return json({ error: { code: 'INVALID_REQUEST', message: 'Enter a valid electricity provider, meter, meter type, phone, amount and purchase reference.' } }, 400);
+  }
+  const amountMinor = Math.round(amount * 100);
+  let provider: ReturnType<typeof normalizeUtilityProviders>[number] | undefined;
+  try {
+    provider = normalizeUtilityProviders(await topupmateRequest(env, '/services/?service=electricity')).find(item => String(item.id) === providerId);
+  } catch {
+    return json({ error: { code: 'ELECTRICITY_PROVIDERS_UNAVAILABLE', message: 'The live electricity provider list could not be checked.' } }, 502);
+  }
+  if (!provider?.available) return json({ error: { code: 'PROVIDER_NOT_AVAILABLE', message: 'The selected electricity provider is unavailable.' } }, 409);
+  const existing = await env.DB.prepare('SELECT service, provider_id, provider_name, total_amount_minor, status, pins_json FROM service_transactions WHERE user_id=? AND reference=?').bind(auth.user.uid, reference).first<Record<string, unknown>>();
+  if (existing) {
+    if (existing.service !== 'electricity' || String(existing.provider_id) !== providerId || Number(existing.total_amount_minor) !== amountMinor) return json({ error: { code: 'REFERENCE_CONFLICT', message: 'This order reference belongs to another purchase.' } }, 409);
+    if (existing.status === 'failed') return json({ error: { code: 'PREVIOUS_ORDER_FAILED', message: 'This order failed and its wallet debit was refunded. Start a new order.' } }, 409);
+    let delivery: unknown = [];
+    try { delivery = existing.pins_json ? JSON.parse(String(existing.pins_json)) : []; } catch { delivery = []; }
+    return json({ reference, status: existing.status, provider: { id: providerId, name: String(existing.provider_name) }, amount, hasDelivery: existing.status === 'successful' && Array.isArray(delivery) && delivery.length > 0, message: 'This order reference has already been recorded. Check its status before submitting again.' }, existing.status === 'successful' ? 200 : 202);
+  }
+  try {
+    const verification = await topupmateRequest(env, '/electricity/verify/', 'POST', { provider: provider.id, meternumber: meterNumber, metertype: meterType });
+    if (getSupplierTransactionStatus(verification) !== 'successful') return json({ error: { code: 'ELECTRICITY_VERIFICATION_FAILED', message: 'TopupMate could not verify the meter. Your wallet has not been charged.' } }, 422);
+  } catch {
+    return json({ error: { code: 'ELECTRICITY_VERIFICATION_UNAVAILABLE', message: 'TopupMate could not verify the meter. Your wallet has not been charged.' } }, 502);
+  }
+  const now = Date.now();
+  const debitId = `debit:${crypto.randomUUID()}`;
+  const debit = await env.DB.batch([
+    env.DB.prepare("INSERT INTO wallet_entries (id,user_id,reference,entry_type,amount_minor,created_at) SELECT ?,?,?, 'service_debit',?,? WHERE EXISTS (SELECT 1 FROM wallets WHERE user_id=? AND balance_minor>=?) ON CONFLICT(user_id,reference,entry_type) DO NOTHING").bind(debitId, auth.user.uid, reference, amountMinor, now, auth.user.uid, amountMinor),
+    env.DB.prepare('UPDATE wallets SET balance_minor=balance_minor-?,updated_at=? WHERE user_id=? AND balance_minor>=? AND EXISTS (SELECT 1 FROM wallet_entries WHERE id=? AND reference=?)').bind(amountMinor, now, auth.user.uid, amountMinor, debitId, reference),
+    env.DB.prepare("INSERT INTO service_transactions (user_id,reference,service,provider_id,provider_name,quantity,unit_price_minor,total_amount_minor,currency,status,created_at,updated_at,debited_at) SELECT ?,?,'electricity',?,?,1,?,?,'NGN','processing',?,?,? WHERE EXISTS (SELECT 1 FROM wallet_entries WHERE id=? AND reference=?) ON CONFLICT(user_id,reference) DO NOTHING").bind(auth.user.uid, reference, providerId, provider.name, amountMinor, amountMinor, now, now, now, debitId, reference),
+  ]);
+  if (((debit[0] as { meta?: { changes?: number } }).meta?.changes || 0) !== 1) return json({ error: { code: 'INSUFFICIENT_WALLET_BALANCE', message: 'Your wallet balance is insufficient or this request was already claimed.' } }, 402);
+  let supplier: unknown;
+  try {
+    supplier = await topupmateRequest(env, '/electricity/', 'POST', { provider: provider.id, metertype: meterType, meternumber: meterNumber, amount, phone, ref: reference });
+  } catch {
+    await env.DB.prepare("UPDATE service_transactions SET status='pending',failure_code='SUPPLIER_OUTCOME_UNCERTAIN',updated_at=? WHERE user_id=? AND reference=? AND status='processing'").bind(Date.now(), auth.user.uid, reference).run();
+    return json({ reference, status: 'pending', provider: { id: providerId, name: provider.name }, amount, hasDelivery: false, message: 'Your electricity order is awaiting supplier confirmation. Check its status before submitting again.' }, 202);
+  }
+  const providerStatus = getSupplierTransactionStatus(supplier);
+  if (providerStatus === 'failed') {
+    const refundRequest = new Request(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify({ reference, failureCode: 'TOPUPMATE_PURCHASE_FAILED' }) });
+    await refundD1Service(refundRequest, env);
+    return json({ error: { code: 'TOPUPMATE_PURCHASE_FAILED', message: 'The electricity payment failed. Your wallet was refunded.' } }, 502);
+  }
+  const status = providerStatus === 'successful' ? 'successful' : 'pending';
+  const delivery = collectPins(supplier);
+  await env.DB.prepare('UPDATE service_transactions SET status=?,provider_status=?,pins_json=?,updated_at=? WHERE user_id=? AND reference=?').bind(status, providerStatus, JSON.stringify(delivery), Date.now(), auth.user.uid, reference).run();
+  return json({ reference, status, provider: { id: providerId, name: provider.name }, amount, hasDelivery: status === 'successful' && delivery.length > 0, message: status === 'successful' ? delivery.length ? 'The electricity payment was confirmed and the token is ready to download.' : 'The electricity payment was confirmed. The token is not available from the supplier response yet.' : 'Your electricity order is awaiting supplier confirmation.' }, status === 'successful' ? 200 : 202);
 }
 
 async function topupmateRequest(env: Env, path: string, method: 'GET' | 'POST' = 'GET', body?: unknown) {
@@ -687,6 +770,7 @@ const worker = {
     const url = new URL(request.url);
     const walletRoute = url.pathname.startsWith('/api/cloudflare/wallet')
       || url.pathname === '/api/cloudflare/transactions'
+      || url.pathname.startsWith('/api/cloudflare/transactions/')
       || url.pathname === '/api/cloudflare/sme/transaction-status'
       || url.pathname.startsWith('/api/cloudflare/paystack/')
       || url.pathname.startsWith('/api/cloudflare/services/');
@@ -717,8 +801,11 @@ const worker = {
     if (fundingMatch && request.method === 'GET') return getD1Funding(request, env, decodeURIComponent(fundingMatch[1]));
     if (url.pathname === '/api/cloudflare/transactions' && request.method === 'GET') return listD1Transactions(request, env);
     if (url.pathname === '/api/cloudflare/wallet/funding' && request.method === 'POST') return createD1Funding(request, env);
+    const deliveryMatch = url.pathname.match(/^\/api\/cloudflare\/transactions\/([^/]+)\/delivery$/);
+    if (deliveryMatch && request.method === 'GET') return getD1TransactionDelivery(request, env, decodeURIComponent(deliveryMatch[1]));
     if (url.pathname === '/api/cloudflare/services/exam/purchase' && request.method === 'POST') return purchaseD1ExamPin(request, env);
     if (url.pathname === '/api/cloudflare/services/airtime/purchase' && request.method === 'POST') return purchaseD1Airtime(request, env);
+    if (url.pathname === '/api/cloudflare/services/electricity/purchase' && request.method === 'POST') return purchaseD1Electricity(request, env);
     if (url.pathname === '/api/cloudflare/paystack/callback' && request.method === 'GET') return fundingCallback(request, env);
     if (url.pathname === '/api/cloudflare/paystack/webhook' && request.method === 'POST') return paystackWebhook(request, env);
     if (url.pathname === '/api/cloudflare/services/exam/debit' && request.method === 'POST') return debitD1Service(request, env);
