@@ -21,7 +21,7 @@ Preview wallet funding uses `FLW_MODE=test` and the separate `sameduhub-preview`
 
 ## Production safety
 
-`wrangler.jsonc` has the Cloudflare wallet cutover enabled after reconciling the single wallet in the Firebase export with its zero-balance D1 record. Live Flutterwave funding and TopupMate purchases remain disabled until the supplier wallet is funded and provider status checks are confirmed. Preview settings do not change production settings.
+`wrangler.jsonc` currently enables the Cloudflare wallet cutover, Flutterwave funding, and TopupMate purchases. The single production wallet was reconciled against the provided Firebase export and has a zero balance; preview sandbox credits remain in a separate D1 database. Fund the live TopupMate supplier wallet before placing any purchase, and disable supplier purchases if the supplier balance or transaction-status checks are unhealthy. Preview settings do not change production settings.
 
 ### Live payment and supplier setup
 
@@ -34,7 +34,7 @@ Preview wallet funding uses `FLW_MODE=test` and the separate `sameduhub-preview`
 3. In Flutterwave, set the webhook URL to `https://sameduhub-api.<your-workers-domain>/api/cloudflare/flutterwave/webhook` and use the same webhook secret hash stored as `FLW_SECRET_HASH`. The checkout callback is generated from the Worker URL unless `FLW_REDIRECT_URL` is set.
 4. Fund the TopupMate supplier wallet in the TopupMate dashboard. This is separate from funding a customer wallet through Flutterwave.
 5. Before enabling production wallet cutover, reconcile production D1 wallets and pending transactions against Firebase. Do not copy preview/test wallet credits into production. The current single wallet was matched to the Firebase export; the confirmed sandbox funding attempts were marked failed without credit.
-6. After funding the TopupMate supplier wallet and confirming transaction-status lookup, enable `CLOUDFLARE_FUNDING_ENABLED` and `TOPUPMATE_PURCHASES_ENABLED` in `wrangler.jsonc` and deploy the production Worker. Wallet cutover is already enabled. A test-mode Flutterwave key cannot fund or unlock live supplier purchases.
+6. Production funding and purchases are enabled in `wrangler.jsonc`. Before placing a live order, fund the TopupMate supplier wallet and confirm transaction-status lookup. Disable `TOPUPMATE_PURCHASES_ENABLED` if supplier balance or status checks are unhealthy. A test-mode Flutterwave key cannot fund or unlock live supplier purchases.
 
 Use `wrangler secret put <NAME> --config wrangler.jsonc` to add each production secret interactively. Preview deployments no longer upload `.dev.vars`; add preview-only credentials with `wrangler secret put <NAME> --config wrangler.preview.jsonc`. Keep test and live credentials in their matching Worker environments. Configure `TOPUPMATE_API_BASE_URL` as a Worker variable in each environment; it is not a secret.
 

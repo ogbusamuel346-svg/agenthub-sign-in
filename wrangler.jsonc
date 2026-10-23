@@ -17,8 +17,8 @@
     "TOPUPMATE_API_BASE_URL": "https://connect.topupmate.com/api/",
     "TOPUPMATE_REQUEST_TIMEOUT_MS": "15000",
     "CLOUDFLARE_WALLET_CUTOVER": "true",
-    "CLOUDFLARE_FUNDING_ENABLED": "false",
-    "TOPUPMATE_PURCHASES_ENABLED": "false"
+    "CLOUDFLARE_FUNDING_ENABLED": "true",
+    "TOPUPMATE_PURCHASES_ENABLED": "true"
   },
   "d1_databases": [
     {
