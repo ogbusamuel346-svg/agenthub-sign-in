@@ -36,22 +36,17 @@ import {
   getWalletBalance,
   getWalletFundingStatus,
   reconcileWalletFunding,
-  recordPaystackWebhookEvent,
+  recordFlutterwaveWebhookEvent,
   WalletError,
 } from './wallet';
-import { isValidPaystackWebhookSignature, makeWebhookEventKey } from './walletSecurity';
+import { isValidFlutterwaveWebhookSignature, makeWebhookEventKey } from './walletSecurity';
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 loadEnv({ path: path.join(projectRoot, '.env.local') });
 loadEnv({ path: path.join(projectRoot, '.env') });
 const app = express();
 app.disable('x-powered-by');
-app.use(express.json({
-  limit: '64kb',
-  verify: (req, _res, buffer) => {
-    if (req.originalUrl === '/api/paystack/webhook') (req as Request & { rawBody?: Buffer }).rawBody = Buffer.from(buffer);
-  },
-}));
+app.use(express.json({ limit: '64kb' }));
 
 function sendError(res: Response, error: unknown) {
   if (error instanceof TopupmateApiError) {
@@ -141,11 +136,12 @@ app.get('/api/wallet/funding/:txRef', requireFirebaseUser, asyncRoute(async (req
   res.json(await getWalletFundingStatus(user.uid, req.params.txRef));
 }));
 
-app.get('/api/paystack/callback', asyncRoute(async (req, res) => {
-  const txRef = typeof req.query.reference === 'string' ? req.query.reference : typeof req.query.trxref === 'string' ? req.query.trxref : '';
-  if (!txRef) throw new WalletError('Paystack callback is missing its reference.', 400, 'INVALID_PAYSTACK_CALLBACK');
-  const result = await reconcileWalletFunding(txRef);
-  const frontendReturnUrl = process.env.PAYSTACK_FRONTEND_RETURN_URL?.trim();
+app.get('/api/flutterwave/callback', asyncRoute(async (req, res) => {
+  const txRef = typeof req.query.tx_ref === 'string' ? req.query.tx_ref : '';
+  const transactionId = typeof req.query.transaction_id === 'string' ? req.query.transaction_id : '';
+  if (!txRef || !transactionId) throw new WalletError('Flutterwave callback is missing tx_ref or transaction_id.', 400, 'INVALID_FLUTTERWAVE_CALLBACK');
+  const result = await reconcileWalletFunding(txRef, transactionId);
+  const frontendReturnUrl = process.env.FLW_FRONTEND_RETURN_URL?.trim();
   if (frontendReturnUrl) {
     const redirect = new URL(frontendReturnUrl);
     redirect.searchParams.set('wallet_tx_ref', result.txRef);
@@ -156,28 +152,27 @@ app.get('/api/paystack/callback', asyncRoute(async (req, res) => {
   res.json(result);
 }));
 
-app.post('/api/paystack/webhook', asyncRoute(async (req, res) => {
-  const signature = req.get('x-paystack-signature');
-  const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
-  if (!isValidPaystackWebhookSignature(signature, process.env.PAYSTACK_SECRET_KEY?.trim(), rawBody)) {
+app.post('/api/flutterwave/webhook', asyncRoute(async (req, res) => {
+  const signature = req.get('verif-hash');
+  if (!isValidFlutterwaveWebhookSignature(signature, process.env.FLW_SECRET_HASH?.trim())) {
     res.status(401).end();
     return;
   }
 
-  const payload = req.body as { event?: unknown; data?: { id?: unknown; reference?: unknown; status?: unknown } };
+  const payload = req.body as { event?: unknown; data?: { id?: unknown; tx_ref?: unknown; status?: unknown } };
   const event = typeof payload.event === 'string' ? payload.event : '';
   const data = payload.data;
   const transactionId = data && data.id !== undefined ? String(data.id) : '';
-  const txRef = data && typeof data.reference === 'string' ? data.reference : '';
+  const txRef = data && typeof data.tx_ref === 'string' ? data.tx_ref : '';
   const status = data && typeof data.status === 'string' ? data.status : '';
-  if (event !== 'charge.success' || !transactionId || !txRef || status !== 'success') {
+  if (!event || !transactionId || !txRef || !status) {
     res.status(200).end();
     return;
   }
 
   const eventKey = makeWebhookEventKey(event, transactionId, status);
   const result = await reconcileWalletFunding(txRef, transactionId);
-  await recordPaystackWebhookEvent(eventKey, { event, transactionId, txRef, status });
+  await recordFlutterwaveWebhookEvent(eventKey, { event, transactionId, txRef, status });
   res.status(200).json({ ok: true, status: result.status });
 }));
 

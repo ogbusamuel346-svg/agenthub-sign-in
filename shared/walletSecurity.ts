@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual } from 'node:crypto';
 
 export type WalletFundingClaim = {
   txRef: string;
@@ -14,11 +14,11 @@ export type WalletState = {
   [key: string]: unknown;
 };
 
-export type VerifiedPaystackTransaction = {
+export type VerifiedFlutterwaveTransaction = {
   id: string;
-  reference: string;
+  txRef: string;
   status: string;
-  amountMinor: number;
+  amount: number;
   currency: string;
   customerEmail?: string;
 };
@@ -32,7 +32,7 @@ type FundingRecordLike = {
 export function walletFundingLedgerEntry(record: { txRef: string; amountMinor: number; currency: 'NGN' }, providerTransactionId: string, createdAt: number) {
   return {
     type: 'wallet_funding',
-    source: 'paystack',
+    source: 'flutterwave',
     txRef: record.txRef,
     providerTransactionId,
     amountMinor: record.amountMinor,
@@ -51,28 +51,13 @@ export class WalletTransactionValidationError extends Error {
   }
 }
 
-// Paystack signs the exact webhook request bytes with HMAC-SHA512 and the secret key.
-export function isValidPaystackWebhookSignature(signature: string | undefined, secretKey: string | undefined, rawBody: Uint8Array | undefined) {
-  if (!signature || !secretKey || !rawBody) return false;
-  const expected = createHmac('sha512', secretKey).update(rawBody).digest();
-  const actual = Buffer.from(signature, 'hex');
-  if (actual.length !== expected.length) return false;
-  return timingSafeEqual(actual, expected);
-}
-
-export function validateSuccessfulPaystackTransaction(record: FundingRecordLike, transaction: VerifiedPaystackTransaction) {
-  if (transaction.status !== 'success') {
-    throw new WalletTransactionValidationError('Paystack did not report a successful payment.', 'PAYMENT_NOT_SUCCESSFUL');
-  }
-  if (transaction.reference !== record.txRef) {
-    throw new WalletTransactionValidationError('The Paystack transaction reference does not match the pending funding attempt.', 'REFERENCE_MISMATCH');
-  }
-  if (transaction.currency.toUpperCase() !== 'NGN') {
-    throw new WalletTransactionValidationError('The Paystack transaction currency is not NGN.', 'CURRENCY_MISMATCH');
-  }
-  if (transaction.amountMinor !== record.amountMinor) {
-    throw new WalletTransactionValidationError('The Paystack transaction amount does not match the pending funding attempt.', 'AMOUNT_MISMATCH');
-  }
+// Flutterwave v3 Standard sends the configured secret in verif-hash.
+// Authenticate the notification, then independently verify the payment via API.
+export function isValidFlutterwaveWebhookSignature(signature: string | undefined, secretHash: string | undefined) {
+  if (!signature || !secretHash) return false;
+  const expected = Buffer.from(secretHash, 'utf8');
+  const actual = Buffer.from(signature, 'utf8');
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
 export function applyWalletFundingClaim(current: unknown, claim: WalletFundingClaim) {
@@ -114,6 +99,25 @@ export function applyWalletFundingClaim(current: unknown, claim: WalletFundingCl
     },
     applied: true,
   };
+}
+
+export function validateSuccessfulFlutterwaveTransaction(record: FundingRecordLike, transaction: VerifiedFlutterwaveTransaction) {
+  if (transaction.status !== 'successful') {
+    throw new WalletTransactionValidationError('Flutterwave did not report a successful payment.', 'PAYMENT_NOT_SUCCESSFUL');
+  }
+  if (transaction.txRef !== record.txRef) {
+    throw new WalletTransactionValidationError('The Flutterwave transaction reference does not match the pending funding attempt.', 'REFERENCE_MISMATCH');
+  }
+  if (transaction.currency.toUpperCase() !== 'NGN') {
+    throw new WalletTransactionValidationError('The Flutterwave transaction currency is not NGN.', 'CURRENCY_MISMATCH');
+  }
+  if (Math.round(transaction.amount * 100) !== record.amountMinor) {
+    throw new WalletTransactionValidationError('The Flutterwave transaction amount does not match the pending funding attempt.', 'AMOUNT_MISMATCH');
+  }
+  // Do not require the payer's Flutterwave email to match the signed-in
+  // account. Hosted checkout may omit or allow a different payer email. The
+  // verified, server-generated tx_ref binds this payment to the wallet record;
+  // status, amount, and currency are still checked above.
 }
 
 export function makeWebhookEventKey(event: string, transactionId: string, status: string) {

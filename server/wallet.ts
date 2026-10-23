@@ -1,18 +1,18 @@
 import { randomBytes } from 'node:crypto';
 import { getFirebaseAdminDatabase } from './firebaseAdmin';
-import { verifyPaystackTransaction as verifySharedPaystackTransaction } from '../shared/paystack';
+import { verifyFlutterwaveTransaction as verifySharedFlutterwaveTransaction } from '../shared/flutterwave';
 import {
   applyWalletFundingClaim,
   walletFundingLedgerEntry,
   parseAmountToMinor,
   requireCustomerEmail,
-  validateSuccessfulPaystackTransaction,
-  type VerifiedPaystackTransaction,
+  validateSuccessfulFlutterwaveTransaction,
+  type VerifiedFlutterwaveTransaction,
   type WalletFundingRecord,
   type WalletState,
 } from './walletSecurity';
 
-const PAYSTACK_API_URL = 'https://api.paystack.co';
+const FLUTTERWAVE_API_URL = 'https://api.flutterwave.com/v3';
 
 export class WalletError extends Error {
   status: number;
@@ -32,13 +32,13 @@ type FirebaseUserDetails = {
   name?: string;
 };
 
-type PaystackResponse = {
-  status?: boolean;
+type FlutterwaveResponse = {
+  status?: string;
   message?: string;
   data?: {
-    authorization_url?: string;
-    reference?: string;
+    link?: string;
     id?: number | string;
+    tx_ref?: string;
     status?: string;
     amount?: number | string;
     currency?: string;
@@ -50,15 +50,6 @@ function requiredEnv(name: string) {
   const value = process.env[name]?.trim();
   if (!value) throw new WalletError(`${name} is not configured on the server.`, 503, 'WALLET_NOT_CONFIGURED');
   return value;
-}
-
-function paystackSecret() {
-  const secret = requiredEnv('PAYSTACK_SECRET_KEY');
-  const mode = process.env.PAYSTACK_MODE;
-  if ((mode === 'test' && !secret.startsWith('sk_test_')) || (mode === 'live' && !secret.startsWith('sk_live_')) || (mode !== 'test' && mode !== 'live')) {
-    throw new WalletError('Paystack mode does not match its secret key.', 503, 'PAYSTACK_NOT_READY');
-  }
-  return secret;
 }
 
 function getDatabase() {
@@ -110,9 +101,9 @@ async function readFunding(txRef: string) {
   return record;
 }
 
-async function paystackRequest<T>(path: string, init: RequestInit): Promise<T> {
-  const secretKey = paystackSecret();
-  const response = await fetch(`${PAYSTACK_API_URL}${path}`, {
+async function flutterwaveRequest<T>(path: string, init: RequestInit): Promise<T> {
+  const secretKey = requiredEnv('FLW_SECRET_KEY');
+  const response = await fetch(`${FLUTTERWAVE_API_URL}${path}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${secretKey}`,
@@ -121,10 +112,10 @@ async function paystackRequest<T>(path: string, init: RequestInit): Promise<T> {
       ...(init.headers || {}),
     },
   });
-  const payload = await response.json().catch(() => null) as T & { status?: boolean; message?: string } | null;
-  if (!response.ok || !payload || payload.status !== true) {
-    console.warn('[wallet] Paystack request failed', { path, httpStatus: response.status, providerStatus: payload?.status });
-    throw new WalletError('Paystack could not process the wallet funding request.', 502, 'PAYSTACK_REQUEST_FAILED');
+  const payload = await response.json().catch(() => null) as T & { status?: string; message?: string } | null;
+  if (!response.ok || !payload || payload.status !== 'success') {
+    console.warn('[wallet] Flutterwave request failed', { path, httpStatus: response.status, providerStatus: payload?.status });
+    throw new WalletError('Flutterwave could not process the wallet funding request.', 502, 'FLUTTERWAVE_REQUEST_FAILED');
   }
   return payload;
 }
@@ -138,7 +129,7 @@ export async function createWalletFunding(input: { user: FirebaseUserDetails; am
     throw error;
   }
   const { amountMinor, amount } = parseAmountToMinor(input.amount);
-  const redirectUrl = requiredEnv('PAYSTACK_CALLBACK_URL');
+  const redirectUrl = requiredEnv('FLW_REDIRECT_URL');
   const txRef = createFundingReference();
   const now = Date.now();
   const record: WalletFundingRecord = {
@@ -157,20 +148,20 @@ export async function createWalletFunding(input: { user: FirebaseUserDetails; am
   await database.ref(fundingPath(txRef)).set(record);
 
   try {
-    const response = await paystackRequest<PaystackResponse>('/transaction/initialize', {
+    const response = await flutterwaveRequest<FlutterwaveResponse>('/payments', {
       method: 'POST',
       body: JSON.stringify({
-        reference: txRef,
-        amount: String(amountMinor),
+        tx_ref: txRef,
+        amount,
         currency: 'NGN',
-        email,
-        callback_url: redirectUrl,
-        metadata: { user_id: input.user.uid },
+        redirect_url: redirectUrl,
+        customer: { email, name: record.customerName },
+        customizations: { title: 'SamEduHub Wallet Funding' },
       }),
     });
-    const checkoutUrl = response.data?.authorization_url;
-    if (!checkoutUrl || !checkoutUrl.startsWith('https://checkout.paystack.com/') || response.data?.reference !== txRef) {
-      throw new WalletError('Paystack did not return a valid checkout URL.', 502, 'CHECKOUT_URL_MISSING');
+    const checkoutUrl = response.data?.link;
+    if (!checkoutUrl || !checkoutUrl.startsWith('https://')) {
+      throw new WalletError('Flutterwave did not return a valid checkout URL.', 502, 'CHECKOUT_URL_MISSING');
     }
     await updateFunding(txRef, { status: 'checkout_created', checkoutUrl });
     return { txRef, amount, currency: 'NGN', status: 'checkout_created', checkoutUrl };
@@ -180,36 +171,36 @@ export async function createWalletFunding(input: { user: FirebaseUserDetails; am
   }
 }
 
-async function verifyPaystackFunding(reference: string): Promise<VerifiedPaystackTransaction> {
+async function verifyFlutterwaveTransaction(transactionId: string): Promise<VerifiedFlutterwaveTransaction> {
+  if (!/^\d+$/.test(transactionId)) throw new WalletError('Invalid Flutterwave transaction ID.', 400, 'INVALID_PROVIDER_TRANSACTION_ID');
   try {
-    return await verifySharedPaystackTransaction(reference, paystackSecret());
+    return await verifySharedFlutterwaveTransaction(transactionId, requiredEnv('FLW_SECRET_KEY'));
   } catch (error) {
     if (error instanceof Error) {
       throw new WalletError(error.message === 'provider returned an incomplete verification response'
-        ? 'Paystack returned an incomplete transaction verification response.'
+        ? 'Flutterwave returned an incomplete transaction verification response.'
         : error.message, 502, 'INVALID_PROVIDER_RESPONSE');
     }
     throw error;
   }
 }
 
-export async function reconcileWalletFunding(txRef: string, expectedTransactionId?: string) {
+export async function reconcileWalletFunding(txRef: string, transactionId: string) {
   let record = await readFunding(txRef);
   if (record.status === 'successful') return publicFunding(record);
   await updateFunding(txRef, { status: 'processing' });
   record = await readFunding(txRef);
-  const transaction = await verifyPaystackFunding(record.txRef);
-  if (expectedTransactionId && transaction.id !== expectedTransactionId) throw new WalletError('The Paystack transaction ID does not match the webhook event.', 409, 'TRANSACTION_ID_MISMATCH');
+  const transaction = await verifyFlutterwaveTransaction(transactionId);
 
-  if (transaction.reference !== record.txRef) throw new WalletError('The provider transaction reference does not match the funding attempt.', 409, 'REFERENCE_MISMATCH');
+  if (transaction.txRef !== record.txRef) throw new WalletError('The provider transaction reference does not match the funding attempt.', 409, 'REFERENCE_MISMATCH');
   if (transaction.currency.toUpperCase() !== 'NGN') throw new WalletError('The provider transaction currency is not NGN.', 409, 'CURRENCY_MISMATCH');
 
-  if (transaction.status !== 'success') {
+  if (transaction.status !== 'successful') {
     await updateFunding(txRef, { status: 'failed', providerTransactionId: transaction.id, failureCode: 'PAYMENT_NOT_SUCCESSFUL' });
     return publicFunding(await readFunding(txRef));
   }
 
-  validateSuccessfulPaystackTransaction(record, transaction);
+  validateSuccessfulFlutterwaveTransaction(record, transaction);
   const database = getDatabase();
   const walletReference = database.ref(`wallets/${record.uid}`);
   const claim = { txRef: record.txRef, amountMinor: record.amountMinor, providerTransactionId: transaction.id, createdAt: Date.now() };
@@ -244,8 +235,8 @@ export async function getWalletFundingStatus(uid: string, txRef: string) {
   return publicFunding(record);
 }
 
-export async function recordPaystackWebhookEvent(eventKey: string, event: { event: string; transactionId: string; txRef: string; status: string }) {
-  const reference = getDatabase().ref(`paystackWebhookEvents/${eventKey}`);
+export async function recordFlutterwaveWebhookEvent(eventKey: string, event: { event: string; transactionId: string; txRef: string; status: string }) {
+  const reference = getDatabase().ref(`flutterwaveWebhookEvents/${eventKey}`);
   const result = await reference.transaction((current) => current === null ? { ...event, receivedAt: Date.now() } : undefined);
   return result.committed;
 }

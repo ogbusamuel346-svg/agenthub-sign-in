@@ -77,7 +77,6 @@ export type IntegrationHealth = {
   service?: string;
   supplier: {
     provider?: string;
-    paymentProvider?: 'paystack';
     configured: boolean;
     purchaseEnabled: boolean;
     paymentMode?: 'test' | 'live' | 'unconfigured';

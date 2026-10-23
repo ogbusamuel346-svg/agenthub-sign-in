@@ -12,7 +12,7 @@
   },
   "vars": {
     "FIREBASE_PROJECT_ID": "sameduhub-9f5dd",
-    "PAYSTACK_MODE": "live",
+    "FLW_MODE": "live",
     "TOPUPMATE_MODE": "live",
     "TOPUPMATE_API_BASE_URL": "https://connect.topupmate.com/api/",
     "TOPUPMATE_REQUEST_TIMEOUT_MS": "15000",

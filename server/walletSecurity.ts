@@ -1,12 +1,12 @@
 import {
   applyWalletFundingClaim as applySharedWalletFundingClaim,
-  isValidPaystackWebhookSignature as isValidSharedPaystackWebhookSignature,
+  isValidFlutterwaveWebhookSignature as isValidSharedFlutterwaveWebhookSignature,
   makeWebhookEventKey,
   walletFundingLedgerEntry,
-  validateSuccessfulPaystackTransaction as validateSharedPaystackTransaction,
+  validateSuccessfulFlutterwaveTransaction as validateSharedFlutterwaveTransaction,
   type WalletFundingClaim,
   type WalletState,
-  type VerifiedPaystackTransaction,
+  type VerifiedFlutterwaveTransaction,
 } from '../shared/walletSecurity';
 
 export type WalletFundingStatus = 'pending' | 'checkout_created' | 'processing' | 'successful' | 'failed';
@@ -26,7 +26,7 @@ export type WalletFundingRecord = {
   failureCode?: string;
 };
 
-export type { WalletFundingClaim, WalletState, VerifiedPaystackTransaction } from '../shared/walletSecurity';
+export type { WalletFundingClaim, WalletState, VerifiedFlutterwaveTransaction } from '../shared/walletSecurity';
 
 export class WalletValidationError extends Error {
   code: string;
@@ -59,13 +59,13 @@ export function requireCustomerEmail(value: unknown) {
   return value.trim().toLowerCase();
 }
 
-export function isValidPaystackWebhookSignature(signature: string | undefined, secretKey: string | undefined, rawBody: Uint8Array | undefined) {
-  return isValidSharedPaystackWebhookSignature(signature, secretKey, rawBody);
+export function isValidFlutterwaveWebhookSignature(signature: string | undefined, secretHash: string | undefined) {
+  return isValidSharedFlutterwaveWebhookSignature(signature, secretHash);
 }
 
-export function validateSuccessfulPaystackTransaction(record: WalletFundingRecord, transaction: VerifiedPaystackTransaction) {
+export function validateSuccessfulFlutterwaveTransaction(record: WalletFundingRecord, transaction: VerifiedFlutterwaveTransaction) {
   try {
-    validateSharedPaystackTransaction(record, transaction);
+    validateSharedFlutterwaveTransaction(record, transaction);
   } catch (error) {
     if (error instanceof Error && 'code' in error && typeof error.code === 'string') {
       throw new WalletValidationError(error.message, error.code);
