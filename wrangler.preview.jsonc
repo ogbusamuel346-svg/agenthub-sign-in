@@ -12,11 +12,11 @@
   },
   "vars": {
     "FIREBASE_PROJECT_ID": "sameduhub-9f5dd",
-    "FLW_MODE": "test",
+    "PAYSTACK_MODE": "test",
     "TOPUPMATE_MODE": "live",
     "CLOUDFLARE_WALLET_CUTOVER": "true",
     "CLOUDFLARE_FUNDING_ENABLED": "true",
-    // Flutterwave can be tested with sandbox credentials; TopupMate currently
+    // Paystack can be tested with test credentials; TopupMate currently
     // targets its live API, so keep supplier purchases disabled until funded.
     "TOPUPMATE_PURCHASES_ENABLED": "false"
   },

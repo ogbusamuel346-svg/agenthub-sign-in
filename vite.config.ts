@@ -16,7 +16,7 @@ export default defineConfig(({ mode }) => {
     },
     server: {
       // Let the local preview UI use the preview Worker API. This keeps local
-      // testing on Flutterwave's test environment and the preview D1 database.
+      // testing on Paystack's test environment and the preview D1 database.
       proxy: mode === 'preview' ? {
         '/api': {
           target: 'https://sameduhub-api-preview.ogbusamuelagbaji.workers.dev',

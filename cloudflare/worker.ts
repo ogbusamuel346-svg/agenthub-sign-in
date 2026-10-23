@@ -1,6 +1,6 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose';
-import { verifyFlutterwaveTransaction } from '../shared/flutterwave';
-import { isValidFlutterwaveWebhookSignature, makeWebhookEventKey, validateSuccessfulFlutterwaveTransaction } from '../shared/walletSecurity';
+import { verifyPaystackTransaction } from '../shared/paystack';
+import { isValidPaystackWebhookSignature, makeWebhookEventKey, validateSuccessfulPaystackTransaction } from '../shared/walletSecurity';
 import { getSupplierTransactionStatus, normalizeDataPlans, normalizeNetworks, normalizeExamProducts, normalizeUtilityProviders } from './catalog';
 
 export interface Env {
@@ -17,9 +17,8 @@ export interface Env {
     batch(statements: unknown[]): Promise<unknown[]>;
   };
   ASSETS: { fetch(request: Request): Promise<Response> };
-  FLW_SECRET_KEY?: string;
-  FLW_SECRET_HASH?: string;
-  FLW_MODE?: string;
+  PAYSTACK_SECRET_KEY?: string;
+  PAYSTACK_MODE?: string;
   TOPUPMATE_API_BASE_URL?: string;
   TOPUPMATE_API_TOKEN?: string;
   TOPUPMATE_MODE?: string;
@@ -27,8 +26,7 @@ export interface Env {
   TOPUPMATE_PURCHASES_ENABLED?: string;
   TOPUPMATE_ADMIN_VIEW_TOKEN?: string;
   FIREBASE_PROJECT_ID?: string;
-  FLW_REDIRECT_URL?: string;
-  FLW_FRONTEND_RETURN_URL?: string;
+  PAYSTACK_FRONTEND_RETURN_URL?: string;
   CLOUDFLARE_WALLET_CUTOVER?: string;
   CLOUDFLARE_FUNDING_ENABLED?: string;
 }
@@ -235,20 +233,21 @@ function requireEnv(env: Env, key: keyof Env) {
   return value.trim();
 }
 
-function flutterwaveSecret(env: Env) {
-  const secret = requireEnv(env, 'FLW_SECRET_KEY');
-  const mode = env.FLW_MODE;
-  const isTestKey = /_TEST(?:-|$)/i.test(secret);
-  if ((mode !== 'test' && mode !== 'live') || isTestKey !== (mode === 'test')) {
-    throw new Error('Flutterwave mode does not match its secret key.');
+function paystackSecret(env: Env) {
+  const secret = requireEnv(env, 'PAYSTACK_SECRET_KEY');
+  const mode = env.PAYSTACK_MODE;
+  const isTestKey = secret.startsWith('sk_test_');
+  const isLiveKey = secret.startsWith('sk_live_');
+  if ((mode !== 'test' && mode !== 'live') || (mode === 'test' && !isTestKey) || (mode === 'live' && !isLiveKey)) {
+    throw new Error('Paystack mode does not match its secret key.');
   }
   return secret;
 }
 
-function flutterwaveReady(env: Env, expectedMode?: 'test' | 'live') {
+function paystackReady(env: Env, expectedMode?: 'test' | 'live') {
   try {
-    flutterwaveSecret(env);
-    return expectedMode === undefined || env.FLW_MODE === expectedMode;
+    paystackSecret(env);
+    return expectedMode === undefined || env.PAYSTACK_MODE === expectedMode;
   } catch {
     return false;
   }
@@ -272,16 +271,16 @@ function livePurchasesReady(env: Env) {
     && env.TOPUPMATE_MODE === 'live'
     && topupmateUrlMatchesMode(env, 'live')
     && Boolean(env.TOPUPMATE_API_TOKEN?.trim())
-    && flutterwaveReady(env, 'live');
+    && paystackReady(env, 'live');
 }
 
 async function createD1Funding(request: Request, env: Env) {
   if (env.CLOUDFLARE_FUNDING_ENABLED !== 'true') return json({ error: { code: 'CLOUDFLARE_FUNDING_DISABLED', message: 'Wallet funding is not enabled in this environment.' } }, 503);
-  let flutterwaveKey: string;
+  let paystackKey: string;
   try {
-    flutterwaveKey = flutterwaveSecret(env);
+    paystackKey = paystackSecret(env);
   } catch {
-    return json({ error: { code: 'FLUTTERWAVE_NOT_READY', message: 'Flutterwave credentials are missing or do not match this environment.' } }, 503);
+    return json({ error: { code: 'PAYSTACK_NOT_READY', message: 'Paystack credentials are missing or do not match this environment.' } }, 503);
   }
   const auth = await requireUser(request, env);
   if (!auth.user) return auth.response!;
@@ -291,39 +290,39 @@ async function createD1Funding(request: Request, env: Env) {
   if (!/^\d+(?:\.\d{1,2})?$/.test(rawAmount)) return json({ error: { code: 'INVALID_AMOUNT', message: 'Enter a positive NGN amount with up to two decimal places.' } }, 400);
   const amountMinor = Math.round(Number(rawAmount) * 100);
   if (!Number.isSafeInteger(amountMinor) || amountMinor <= 0) return json({ error: { code: 'INVALID_AMOUNT', message: 'Amount must be greater than zero.' } }, 400);
-  const amount = amountMinor / 100;
   const txRef = `WALLET-${Date.now()}-${crypto.randomUUID().replace(/-/g, '').toUpperCase()}`;
   const now = Date.now();
   const email = auth.user.email.trim().toLowerCase();
   const customerName = auth.user.name?.trim() || email.split('@')[0];
-  const redirectUrl = env.FLW_REDIRECT_URL?.trim() || new URL('/api/cloudflare/flutterwave/callback', request.url).toString();
+  const callbackUrl = new URL('/api/cloudflare/paystack/callback', request.url).toString();
   await env.DB.prepare("INSERT INTO users (id, email, display_name, email_verified, identity_provider, created_at, updated_at) VALUES (?, ?, ?, ?, 'firebase', ?, ?) ON CONFLICT(id) DO UPDATE SET email=excluded.email, display_name=excluded.display_name, email_verified=excluded.email_verified, updated_at=excluded.updated_at").bind(auth.user.uid, email, customerName, auth.user.emailVerified ? 1 : 0, now, now).run();
   await env.DB.prepare("INSERT INTO wallets (user_id, balance_minor, updated_at) VALUES (?, 0, ?) ON CONFLICT(user_id) DO NOTHING").bind(auth.user.uid, now).run();
   await env.DB.prepare("INSERT INTO wallet_funding_transactions (tx_ref, user_id, amount_minor, currency, customer_email, customer_name, status, created_at, updated_at) VALUES (?, ?, ?, 'NGN', ?, ?, 'pending', ?, ?)").bind(txRef, auth.user.uid, amountMinor, email, customerName, now, now).run();
   try {
-    const response = await fetch('https://api.flutterwave.com/v3/payments', {
+    const response = await fetch('https://api.paystack.co/transaction/initialize', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${flutterwaveKey}`, 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ tx_ref: txRef, amount, currency: 'NGN', redirect_url: redirectUrl, customer: { email, name: customerName }, customizations: { title: 'SamEduHub Wallet Funding' } }),
+      headers: { Authorization: `Bearer ${paystackKey}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ reference: txRef, amount: String(amountMinor), currency: 'NGN', email, callback_url: callbackUrl, metadata: { user_id: auth.user.uid } }),
     });
-    const payload = await response.json().catch(() => null) as { status?: string; data?: { link?: string } } | null;
-    const checkoutUrl = payload?.data?.link;
-    if (!response.ok || payload?.status !== 'success' || !checkoutUrl?.startsWith('https://')) throw new Error('Flutterwave checkout could not be created.');
+    const payload = await response.json().catch(() => null) as { status?: boolean; data?: { authorization_url?: string; reference?: string } } | null;
+    const checkoutUrl = payload?.data?.authorization_url;
+    if (!response.ok || payload?.status !== true || payload.data?.reference !== txRef || !checkoutUrl?.startsWith('https://checkout.paystack.com/')) throw new Error('Paystack checkout could not be created.');
     await env.DB.prepare("UPDATE wallet_funding_transactions SET status='checkout_created', checkout_url=?, updated_at=? WHERE tx_ref=? AND status='pending'").bind(checkoutUrl, Date.now(), txRef).run();
-    return json({ txRef, amount, currency: 'NGN', status: 'checkout_created', checkoutUrl }, 201);
+    return json({ txRef, amount: amountMinor / 100, currency: 'NGN', status: 'checkout_created', checkoutUrl }, 201);
   } catch {
     await env.DB.prepare("UPDATE wallet_funding_transactions SET status='failed', failure_code='CHECKOUT_REQUEST_FAILED', updated_at=? WHERE tx_ref=? AND status='pending'").bind(Date.now(), txRef).run();
-    return json({ error: { code: 'FLUTTERWAVE_REQUEST_FAILED', message: 'Flutterwave could not process the wallet funding request.' } }, 502);
+    return json({ error: { code: 'PAYSTACK_REQUEST_FAILED', message: 'Paystack could not process the wallet funding request.' } }, 502);
   }
 }
 
-async function creditD1Funding(env: Env, txRef: string, transactionId: string) {
-  if (!/^\d+$/.test(transactionId) || !/^[A-Za-z0-9_-]{12,160}$/.test(txRef)) throw new Error('invalid transaction reference');
+async function creditD1Funding(env: Env, txRef: string, expectedTransactionId?: string) {
+  if (!/^[A-Za-z0-9_.=-]{12,160}$/.test(txRef)) throw new Error('invalid transaction reference');
   const record = await env.DB.prepare('SELECT tx_ref, user_id, amount_minor, currency, customer_email, customer_name, status, created_at, updated_at FROM wallet_funding_transactions WHERE tx_ref=?').bind(txRef).first<{ tx_ref: string; user_id: string; amount_minor: number; currency: 'NGN'; customer_email: string; customer_name: string; status: string; created_at: number; updated_at: number }>();
   if (!record) return { status: 'ignored' };
   if (record.status === 'successful') return { status: 'already_processed' };
-  const transaction = await verifyFlutterwaveTransaction(transactionId, flutterwaveSecret(env));
-  validateSuccessfulFlutterwaveTransaction({ txRef: record.tx_ref, amountMinor: record.amount_minor, customerEmail: record.customer_email }, transaction);
+  const transaction = await verifyPaystackTransaction(record.tx_ref, paystackSecret(env));
+  if (expectedTransactionId && transaction.id !== expectedTransactionId) throw new Error('provider transaction ID mismatch');
+  validateSuccessfulPaystackTransaction({ txRef: record.tx_ref, amountMinor: record.amount_minor, customerEmail: record.customer_email }, transaction);
   const now = Date.now();
   const entryId = `funding:${crypto.randomUUID()}`;
   const credit = await env.DB.batch([
@@ -336,22 +335,24 @@ async function creditD1Funding(env: Env, txRef: string, transactionId: string) {
   return { status: 'successful' };
 }
 
-async function flutterwaveWebhook(request: Request, env: Env) {
+async function paystackWebhook(request: Request, env: Env) {
   if (env.CLOUDFLARE_FUNDING_ENABLED !== 'true') return new Response(null, { status: 404 });
-  if (!isValidFlutterwaveWebhookSignature(request.headers.get('verif-hash') || undefined, env.FLW_SECRET_HASH)) return new Response(null, { status: 401 });
-  const payload = await request.json().catch(() => null) as { event?: unknown; data?: { id?: unknown; tx_ref?: unknown; status?: unknown } } | null;
+  const rawBody = new Uint8Array(await request.arrayBuffer());
+  if (!isValidPaystackWebhookSignature(request.headers.get('x-paystack-signature') || undefined, env.PAYSTACK_SECRET_KEY, rawBody)) return new Response(null, { status: 401 });
+  let payload: { event?: unknown; data?: { id?: unknown; reference?: unknown; status?: unknown } } | null = null;
+  try { payload = JSON.parse(new TextDecoder().decode(rawBody)); } catch { return json({ ok: false }, 400); }
   const event = typeof payload?.event === 'string' ? payload.event : '';
   const transactionId = payload?.data?.id === undefined ? '' : String(payload.data.id);
-  const txRef = typeof payload?.data?.tx_ref === 'string' ? payload.data.tx_ref : '';
+  const txRef = typeof payload?.data?.reference === 'string' ? payload.data.reference : '';
   const status = typeof payload?.data?.status === 'string' ? payload.data.status : '';
-  if (!event || !transactionId || !txRef || !status) return json({ ok: true, status: 'ignored' });
+  if (event !== 'charge.success' || !transactionId || !txRef || status !== 'success') return json({ ok: true, status: 'ignored' });
   if (!/^\d+$/.test(transactionId)) return json({ ok: true, status: 'unsupported_transaction_format' });
   const eventKey = makeWebhookEventKey(event, transactionId, status);
-  const seen = await env.DB.prepare('SELECT event_key FROM flutterwave_webhook_events WHERE event_key=?').bind(eventKey).first();
+  const seen = await env.DB.prepare('SELECT event_key FROM paystack_webhook_events WHERE event_key=?').bind(eventKey).first();
   if (seen) return json({ ok: true, status: 'already_processed' });
   try {
     const result = await creditD1Funding(env, txRef, transactionId);
-    await env.DB.prepare('INSERT INTO flutterwave_webhook_events (event_key, event, transaction_id, tx_ref, status, received_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(event_key) DO NOTHING').bind(eventKey, event, transactionId, txRef, status, Date.now()).run();
+    await env.DB.prepare('INSERT INTO paystack_webhook_events (event_key, event, transaction_id, tx_ref, status, received_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(event_key) DO NOTHING').bind(eventKey, event, transactionId, txRef, status, Date.now()).run();
     return json({ ok: true, ...result });
   } catch {
     return json({ ok: false }, 500);
@@ -361,16 +362,26 @@ async function flutterwaveWebhook(request: Request, env: Env) {
 async function fundingCallback(request: Request, env: Env) {
   if (env.CLOUDFLARE_FUNDING_ENABLED !== 'true') return json({ error: { code: 'CLOUDFLARE_FUNDING_DISABLED', message: 'Wallet funding is not enabled in this environment.' } }, 503);
   const url = new URL(request.url);
-  const txRef = url.searchParams.get('tx_ref') || '';
-  const transactionId = url.searchParams.get('transaction_id') || '';
-  if (!txRef || !transactionId) return json({ error: { code: 'INVALID_FLUTTERWAVE_CALLBACK', message: 'Callback is missing payment reference details.' } }, 400);
-  try {
-    const result = await creditD1Funding(env, txRef, transactionId);
-    const target = env.FLW_FRONTEND_RETURN_URL?.trim() || new URL('/', request.url).toString();
+  const txRef = url.searchParams.get('reference') || url.searchParams.get('trxref') || '';
+  const target = env.PAYSTACK_FRONTEND_RETURN_URL?.trim() || new URL('/', request.url).toString();
+  const redirectToApp = (status: string, reference = txRef) => {
     const redirect = new URL(target);
-    redirect.searchParams.set('wallet_tx_ref', txRef);
-    redirect.searchParams.set('wallet_status', result.status);
+    if (/^[A-Za-z0-9_-]{12,160}$/.test(reference)) redirect.searchParams.set('wallet_tx_ref', reference);
+    redirect.searchParams.set('wallet_status', status);
     return Response.redirect(redirect.toString(), 303);
+  };
+  if (!/^[A-Za-z0-9_-]{12,160}$/.test(txRef)) return redirectToApp('unverified', '');
+  try {
+    const transaction = await verifyPaystackTransaction(txRef, paystackSecret(env));
+    if (transaction.status === 'success') {
+      const result = await creditD1Funding(env, txRef, transaction.id);
+      return redirectToApp(result.status);
+    }
+    if (['failed', 'abandoned', 'reversed'].includes(transaction.status)) {
+      await env.DB.prepare("UPDATE wallet_funding_transactions SET status='failed', failure_code='PAYMENT_NOT_SUCCESSFUL', updated_at=? WHERE tx_ref=? AND status<>'successful'").bind(Date.now(), txRef).run();
+      return redirectToApp('failed');
+    }
+    return redirectToApp('pending');
   } catch (error) {
     // Keep provider and validation details out of the public callback response,
     // but retain a safe reason in Worker logs so failed legitimate payments can
@@ -384,10 +395,10 @@ async function fundingCallback(request: Request, env: Env) {
         : error instanceof Error && error.message === 'provider returned an incomplete verification response'
           ? 'INCOMPLETE_PROVIDER_RESPONSE'
           : 'VERIFICATION_FAILED');
-    console.error('[wallet] Flutterwave callback verification failed', {
+    console.error('[wallet] Paystack callback verification failed', {
       reason,
     });
-    return json({ error: { code: 'PAYMENT_VERIFICATION_FAILED', message: 'The payment could not be verified.', reason } }, 409);
+    return redirectToApp('pending');
   }
 }
 
@@ -623,19 +634,19 @@ async function catalog(_request: Request, env: Env, service: 'data' | 'network' 
 
 async function cloudflareHealth(env: Env) {
   const purchaseReady = livePurchasesReady(env);
-  const fundingReady = env.CLOUDFLARE_FUNDING_ENABLED === 'true' && flutterwaveReady(env);
+  const fundingReady = env.CLOUDFLARE_FUNDING_ENABLED === 'true' && paystackReady(env);
   try {
     await env.DB.prepare('SELECT 1').first();
     return json({ ok: true, service: 'SamEduHub Cloudflare API', supplier: {
       provider: 'topupmate', configured: Boolean(env.TOPUPMATE_API_TOKEN && env.TOPUPMATE_API_BASE_URL),
-      purchaseEnabled: purchaseReady, paymentMode: env.FLW_MODE === 'test' || env.FLW_MODE === 'live' ? env.FLW_MODE : 'unconfigured', supplierMode: env.TOPUPMATE_MODE === 'sandbox' || env.TOPUPMATE_MODE === 'live' ? env.TOPUPMATE_MODE : 'unconfigured', customerWalletConfigured: env.CLOUDFLARE_WALLET_CUTOVER === 'true',
+      purchaseEnabled: purchaseReady, paymentProvider: 'paystack', paymentMode: env.PAYSTACK_MODE === 'test' || env.PAYSTACK_MODE === 'live' ? env.PAYSTACK_MODE : 'unconfigured', supplierMode: env.TOPUPMATE_MODE === 'sandbox' || env.TOPUPMATE_MODE === 'live' ? env.TOPUPMATE_MODE : 'unconfigured', customerWalletConfigured: env.CLOUDFLARE_WALLET_CUTOVER === 'true',
       transactionStoreConfigured: true, serverAuthConfigured: Boolean(env.FIREBASE_PROJECT_ID),
       fundingEnabled: fundingReady,
     } });
   } catch {
     return json({ ok: false, service: 'SamEduHub Cloudflare API', supplier: {
       provider: 'topupmate', configured: Boolean(env.TOPUPMATE_API_TOKEN && env.TOPUPMATE_API_BASE_URL),
-      purchaseEnabled: false, paymentMode: env.FLW_MODE === 'test' || env.FLW_MODE === 'live' ? env.FLW_MODE : 'unconfigured', supplierMode: env.TOPUPMATE_MODE === 'sandbox' || env.TOPUPMATE_MODE === 'live' ? env.TOPUPMATE_MODE : 'unconfigured', customerWalletConfigured: env.CLOUDFLARE_WALLET_CUTOVER === 'true',
+      purchaseEnabled: false, paymentProvider: 'paystack', paymentMode: env.PAYSTACK_MODE === 'test' || env.PAYSTACK_MODE === 'live' ? env.PAYSTACK_MODE : 'unconfigured', supplierMode: env.TOPUPMATE_MODE === 'sandbox' || env.TOPUPMATE_MODE === 'live' ? env.TOPUPMATE_MODE : 'unconfigured', customerWalletConfigured: env.CLOUDFLARE_WALLET_CUTOVER === 'true',
       transactionStoreConfigured: false, serverAuthConfigured: Boolean(env.FIREBASE_PROJECT_ID),
       fundingEnabled: fundingReady,
     } }, 503);
@@ -648,13 +659,13 @@ const worker = {
     const walletRoute = url.pathname.startsWith('/api/cloudflare/wallet')
       || url.pathname === '/api/cloudflare/transactions'
       || url.pathname === '/api/cloudflare/sme/transaction-status'
-      || url.pathname.startsWith('/api/cloudflare/flutterwave/')
+      || url.pathname.startsWith('/api/cloudflare/paystack/')
       || url.pathname.startsWith('/api/cloudflare/services/');
     const fundingEnabled = env.CLOUDFLARE_FUNDING_ENABLED === 'true';
     const fundingPath = url.pathname === '/api/cloudflare/wallet/funding'
       || /^\/api\/cloudflare\/wallet\/funding\/[^/]+$/.test(url.pathname)
-      || url.pathname === '/api/cloudflare/flutterwave/callback'
-      || url.pathname === '/api/cloudflare/flutterwave/webhook';
+      || url.pathname === '/api/cloudflare/paystack/callback'
+      || url.pathname === '/api/cloudflare/paystack/webhook';
     const previewBalanceRead = url.pathname === '/api/cloudflare/wallet' && request.method === 'GET' && fundingEnabled;
     if (walletRoute && env.CLOUDFLARE_WALLET_CUTOVER !== 'true' && !(fundingEnabled && (fundingPath || previewBalanceRead))) {
       return json({ error: { code: 'CLOUDFLARE_WALLET_NOT_READY', message: 'Cloudflare wallet operations are disabled until existing wallet data has been imported and reconciled.' } }, 503);
@@ -679,8 +690,8 @@ const worker = {
     if (url.pathname === '/api/cloudflare/wallet/funding' && request.method === 'POST') return createD1Funding(request, env);
     if (url.pathname === '/api/cloudflare/services/exam/purchase' && request.method === 'POST') return purchaseD1ExamPin(request, env);
     if (url.pathname === '/api/cloudflare/services/airtime/purchase' && request.method === 'POST') return purchaseD1Airtime(request, env);
-    if (url.pathname === '/api/cloudflare/flutterwave/callback' && request.method === 'GET') return fundingCallback(request, env);
-    if (url.pathname === '/api/cloudflare/flutterwave/webhook' && request.method === 'POST') return flutterwaveWebhook(request, env);
+    if (url.pathname === '/api/cloudflare/paystack/callback' && request.method === 'GET') return fundingCallback(request, env);
+    if (url.pathname === '/api/cloudflare/paystack/webhook' && request.method === 'POST') return paystackWebhook(request, env);
     if (url.pathname === '/api/cloudflare/services/exam/debit' && request.method === 'POST') return debitD1Service(request, env);
     if (url.pathname === '/api/cloudflare/services/exam/refund' && request.method === 'POST') return refundD1Service(request, env);
     if (url.pathname === '/api/cloudflare/sme/transaction-status' && request.method === 'GET') return getD1TransactionStatus(request, env);

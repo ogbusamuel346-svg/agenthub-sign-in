@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import {
   applyWalletFundingClaim,
-  isValidFlutterwaveWebhookSignature,
+  isValidPaystackWebhookSignature,
   parseAmountToMinor,
   requireCustomerEmail,
-  validateSuccessfulFlutterwaveTransaction,
+  validateSuccessfulPaystackTransaction,
   type WalletFundingRecord,
   type WalletState,
 } from './walletSecurity';
@@ -34,31 +35,34 @@ test('rejects insufficient customer information', () => {
 });
 
 test('validates successful payment reference, currency and amount without requiring payer email equality', () => {
-  assert.doesNotThrow(() => validateSuccessfulFlutterwaveTransaction(record, {
-    id: '123', txRef: record.txRef, status: 'successful', amount: 500, currency: 'NGN', customerEmail: record.customerEmail,
+  assert.doesNotThrow(() => validateSuccessfulPaystackTransaction(record, {
+    id: '123', reference: record.txRef, status: 'success', amountMinor: 50000, currency: 'NGN', customerEmail: record.customerEmail,
   }));
-  assert.throws(() => validateSuccessfulFlutterwaveTransaction(record, {
-    id: '123', txRef: record.txRef, status: 'successful', amount: 499, currency: 'NGN', customerEmail: record.customerEmail,
+  assert.throws(() => validateSuccessfulPaystackTransaction(record, {
+    id: '123', reference: record.txRef, status: 'success', amountMinor: 49900, currency: 'NGN', customerEmail: record.customerEmail,
   }), /amount/);
-  assert.doesNotThrow(() => validateSuccessfulFlutterwaveTransaction(record, {
-    id: '123', txRef: record.txRef, status: 'successful', amount: 500, currency: 'NGN', customerEmail: 'other@example.com',
+  assert.doesNotThrow(() => validateSuccessfulPaystackTransaction(record, {
+    id: '123', reference: record.txRef, status: 'success', amountMinor: 50000, currency: 'NGN', customerEmail: 'other@example.com',
   }));
-  assert.doesNotThrow(() => validateSuccessfulFlutterwaveTransaction(record, {
-    id: '123', txRef: record.txRef, status: 'successful', amount: 500, currency: 'NGN',
+  assert.doesNotThrow(() => validateSuccessfulPaystackTransaction(record, {
+    id: '123', reference: record.txRef, status: 'success', amountMinor: 50000, currency: 'NGN',
   }));
-  assert.throws(() => validateSuccessfulFlutterwaveTransaction(record, {
-    id: '123', txRef: record.txRef, status: 'failed', amount: 500, currency: 'NGN', customerEmail: record.customerEmail,
+  assert.throws(() => validateSuccessfulPaystackTransaction(record, {
+    id: '123', reference: record.txRef, status: 'failed', amountMinor: 50000, currency: 'NGN', customerEmail: record.customerEmail,
   }), /successful/);
 });
 
-test('verifies v3 verif-hash and rejects missing, mismatched and HMAC-style values', () => {
-  const secret = 'test-webhook-secret';
-  assert.equal(isValidFlutterwaveWebhookSignature(secret, secret), true);
-  for (const signature of [undefined, '', 'wrong', `${secret}x`, 'YW55LWhhc2g=']) {
-    assert.equal(isValidFlutterwaveWebhookSignature(signature, secret), false);
+test('verifies Paystack raw-body HMAC-SHA512 signatures', () => {
+  const secret = 'sk_test_example_secret';
+  const body = Buffer.from('{"event":"charge.success"}');
+  const signature = createHmac('sha512', secret).update(body).digest('hex');
+  assert.equal(isValidPaystackWebhookSignature(signature, secret, body), true);
+  for (const invalid of [undefined, '', 'wrong', `${signature}00`]) {
+    assert.equal(isValidPaystackWebhookSignature(invalid, secret, body), false);
   }
-  assert.equal(isValidFlutterwaveWebhookSignature(secret, undefined), false);
-  assert.equal(isValidFlutterwaveWebhookSignature('', ''), false);
+  assert.equal(isValidPaystackWebhookSignature(signature, undefined, body), false);
+  assert.equal(isValidPaystackWebhookSignature(signature, secret, undefined), false);
+  assert.equal(isValidPaystackWebhookSignature(signature, secret, Buffer.from('{}')), false);
 });
 
 test('duplicate funding claims do not increase the wallet twice', () => {
