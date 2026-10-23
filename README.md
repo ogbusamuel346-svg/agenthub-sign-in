@@ -17,11 +17,28 @@ The preview Worker is configured in `wrangler.preview.jsonc` and uses the separa
 - `npm run cf:preview:deploy` builds and deploys the preview Worker.
 - `npm run cf:preview:migrate` applies the preview D1 migrations.
 
-Preview wallet funding is enabled for Flutterwave verification. Keep test credentials in `.dev.vars` while testing; do not repeat the Firebase import into D1. TopupMate purchases stay disabled in preview because the configured TopupMate API is live; enable them only after the supplier account is funded and transaction status reconciliation is verified. Flutterwave sandbox mode does not sandbox TopupMate purchases.
+Preview wallet funding uses `FLW_MODE=test` and the separate `sameduhub-preview` D1 database. Preview credits are test data. The preview still points TopupMate reads at its live API for catalogues and reconciliation, but supplier purchases stay disabled. A server-side guard now rejects every TopupMate purchase unless Flutterwave is in live mode with a matching live key, TopupMate is explicitly configured for live mode and the live API URL, the customer wallet cutover is enabled, and supplier purchases are enabled. Flutterwave sandbox mode never makes a TopupMate purchase safe.
 
 ## Production safety
 
-`wrangler.jsonc` keeps wallet cutover, wallet funding, and supplier purchases disabled. Keep those flags disabled until the production data, balances, and transaction history have been reconciled. Preview settings do not change production settings.
+`wrangler.jsonc` has the Cloudflare wallet cutover enabled after reconciling the single wallet in the Firebase export with its zero-balance D1 record. Live Flutterwave funding and TopupMate purchases remain disabled until the supplier wallet is funded and provider status checks are confirmed. Preview settings do not change production settings.
+
+### Live payment and supplier setup
+
+1. In the Cloudflare dashboard, select the **`sameduhub-api` production Worker**, then add these server-side secrets under **Settings → Variables and Secrets**. Never add them to `VITE_` variables, `.env.local`, Git, or chat:
+   - `FLW_SECRET_KEY`: Flutterwave **Live** secret key.
+   - `FLW_SECRET_HASH`: the webhook secret hash configured in Flutterwave.
+   - `TOPUPMATE_API_TOKEN`: the TopupMate **Live** API token.
+   Also add `TOPUPMATE_API_BASE_URL` as a Worker variable with value `https://connect.topupmate.com/api/`.
+2. Keep `wrangler.jsonc` set to `FLW_MODE: "live"` and `TOPUPMATE_MODE: "live"`. The Worker rejects test Flutterwave keys in this environment.
+3. In Flutterwave, set the webhook URL to `https://sameduhub-api.<your-workers-domain>/api/cloudflare/flutterwave/webhook` and use the same webhook secret hash stored as `FLW_SECRET_HASH`. The checkout callback is generated from the Worker URL unless `FLW_REDIRECT_URL` is set.
+4. Fund the TopupMate supplier wallet in the TopupMate dashboard. This is separate from funding a customer wallet through Flutterwave.
+5. Before enabling production wallet cutover, reconcile production D1 wallets and pending transactions against Firebase. Do not copy preview/test wallet credits into production. The current single wallet was matched to the Firebase export; the confirmed sandbox funding attempts were marked failed without credit.
+6. After funding the TopupMate supplier wallet and confirming transaction-status lookup, enable `CLOUDFLARE_FUNDING_ENABLED` and `TOPUPMATE_PURCHASES_ENABLED` in `wrangler.jsonc` and deploy the production Worker. Wallet cutover is already enabled. A test-mode Flutterwave key cannot fund or unlock live supplier purchases.
+
+Use `wrangler secret put <NAME> --config wrangler.jsonc` to add each production secret interactively. Preview deployments no longer upload `.dev.vars`; add preview-only credentials with `wrangler secret put <NAME> --config wrangler.preview.jsonc`. Keep test and live credentials in their matching Worker environments. Configure `TOPUPMATE_API_BASE_URL` as a Worker variable in each environment; it is not a secret.
+
+The production Vite build uses `.env.production` to route browser wallet and VTU requests to the Cloudflare Worker. `npm run cf:deploy` builds the production frontend with this setting before deploying `wrangler.jsonc`.
 
 ## Migration tools
 

@@ -79,6 +79,8 @@ export type IntegrationHealth = {
     provider?: string;
     configured: boolean;
     purchaseEnabled: boolean;
+    paymentMode?: 'test' | 'live' | 'unconfigured';
+    supplierMode?: 'sandbox' | 'live' | 'unconfigured';
     customerWalletConfigured: boolean;
     transactionStoreConfigured: boolean;
     serverAuthConfigured: boolean;

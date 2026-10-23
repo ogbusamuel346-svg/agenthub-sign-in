@@ -11,7 +11,12 @@
     "run_worker_first": ["/api/*"]
   },
   "vars": {
-    "CLOUDFLARE_WALLET_CUTOVER": "false",
+    "FIREBASE_PROJECT_ID": "sameduhub-9f5dd",
+    "FLW_MODE": "live",
+    "TOPUPMATE_MODE": "live",
+    "TOPUPMATE_API_BASE_URL": "https://connect.topupmate.com/api/",
+    "TOPUPMATE_REQUEST_TIMEOUT_MS": "15000",
+    "CLOUDFLARE_WALLET_CUTOVER": "true",
     "CLOUDFLARE_FUNDING_ENABLED": "false",
     "TOPUPMATE_PURCHASES_ENABLED": "false"
   },

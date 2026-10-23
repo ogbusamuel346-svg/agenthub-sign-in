@@ -11,6 +11,9 @@
     "run_worker_first": ["/api/*"]
   },
   "vars": {
+    "FIREBASE_PROJECT_ID": "sameduhub-9f5dd",
+    "FLW_MODE": "test",
+    "TOPUPMATE_MODE": "live",
     "CLOUDFLARE_WALLET_CUTOVER": "true",
     "CLOUDFLARE_FUNDING_ENABLED": "true",
     // Flutterwave can be tested with sandbox credentials; TopupMate currently

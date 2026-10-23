@@ -8,6 +8,7 @@ coverage/
 .env*
 !.env.example
 !.env.preview
+!.env.production
 *firebase-adminsdk*.json
 serviceAccountKey.json
 .dev.vars

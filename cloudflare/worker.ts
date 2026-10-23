@@ -19,8 +19,10 @@ export interface Env {
   ASSETS: { fetch(request: Request): Promise<Response> };
   FLW_SECRET_KEY?: string;
   FLW_SECRET_HASH?: string;
+  FLW_MODE?: string;
   TOPUPMATE_API_BASE_URL?: string;
   TOPUPMATE_API_TOKEN?: string;
+  TOPUPMATE_MODE?: string;
   TOPUPMATE_REQUEST_TIMEOUT_MS?: string;
   TOPUPMATE_PURCHASES_ENABLED?: string;
   TOPUPMATE_ADMIN_VIEW_TOKEN?: string;
@@ -233,8 +235,54 @@ function requireEnv(env: Env, key: keyof Env) {
   return value.trim();
 }
 
+function flutterwaveSecret(env: Env) {
+  const secret = requireEnv(env, 'FLW_SECRET_KEY');
+  const mode = env.FLW_MODE;
+  const isTestKey = /_TEST(?:-|$)/i.test(secret);
+  if ((mode !== 'test' && mode !== 'live') || isTestKey !== (mode === 'test')) {
+    throw new Error('Flutterwave mode does not match its secret key.');
+  }
+  return secret;
+}
+
+function flutterwaveReady(env: Env, expectedMode?: 'test' | 'live') {
+  try {
+    flutterwaveSecret(env);
+    return expectedMode === undefined || env.FLW_MODE === expectedMode;
+  } catch {
+    return false;
+  }
+}
+
+function topupmateUrlMatchesMode(env: Env, mode: 'sandbox' | 'live') {
+  if (!env.TOPUPMATE_API_BASE_URL) return false;
+  try {
+    const url = new URL(env.TOPUPMATE_API_BASE_URL);
+    return url.protocol === 'https:'
+      && url.hostname === 'connect.topupmate.com'
+      && url.pathname.replace(/\/+$/, '') === (mode === 'sandbox' ? '/sandbox' : '/api');
+  } catch {
+    return false;
+  }
+}
+
+function livePurchasesReady(env: Env) {
+  return env.CLOUDFLARE_WALLET_CUTOVER === 'true'
+    && env.TOPUPMATE_PURCHASES_ENABLED === 'true'
+    && env.TOPUPMATE_MODE === 'live'
+    && topupmateUrlMatchesMode(env, 'live')
+    && Boolean(env.TOPUPMATE_API_TOKEN?.trim())
+    && flutterwaveReady(env, 'live');
+}
+
 async function createD1Funding(request: Request, env: Env) {
   if (env.CLOUDFLARE_FUNDING_ENABLED !== 'true') return json({ error: { code: 'CLOUDFLARE_FUNDING_DISABLED', message: 'Wallet funding is not enabled in this environment.' } }, 503);
+  let flutterwaveKey: string;
+  try {
+    flutterwaveKey = flutterwaveSecret(env);
+  } catch {
+    return json({ error: { code: 'FLUTTERWAVE_NOT_READY', message: 'Flutterwave credentials are missing or do not match this environment.' } }, 503);
+  }
   const auth = await requireUser(request, env);
   if (!auth.user) return auth.response!;
   if (!auth.user.email) return json({ error: { code: 'AUTH_EMAIL_REQUIRED', message: 'Your Firebase account must have an email address.' } }, 400);
@@ -255,7 +303,7 @@ async function createD1Funding(request: Request, env: Env) {
   try {
     const response = await fetch('https://api.flutterwave.com/v3/payments', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${requireEnv(env, 'FLW_SECRET_KEY')}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: { Authorization: `Bearer ${flutterwaveKey}`, 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ tx_ref: txRef, amount, currency: 'NGN', redirect_url: redirectUrl, customer: { email, name: customerName }, customizations: { title: 'SamEduHub Wallet Funding' } }),
     });
     const payload = await response.json().catch(() => null) as { status?: string; data?: { link?: string } } | null;
@@ -274,7 +322,7 @@ async function creditD1Funding(env: Env, txRef: string, transactionId: string) {
   const record = await env.DB.prepare('SELECT tx_ref, user_id, amount_minor, currency, customer_email, customer_name, status, created_at, updated_at FROM wallet_funding_transactions WHERE tx_ref=?').bind(txRef).first<{ tx_ref: string; user_id: string; amount_minor: number; currency: 'NGN'; customer_email: string; customer_name: string; status: string; created_at: number; updated_at: number }>();
   if (!record) return { status: 'ignored' };
   if (record.status === 'successful') return { status: 'already_processed' };
-  const transaction = await verifyFlutterwaveTransaction(transactionId, requireEnv(env, 'FLW_SECRET_KEY'));
+  const transaction = await verifyFlutterwaveTransaction(transactionId, flutterwaveSecret(env));
   validateSuccessfulFlutterwaveTransaction({ txRef: record.tx_ref, amountMinor: record.amount_minor, customerEmail: record.customer_email }, transaction);
   const now = Date.now();
   const entryId = `funding:${crypto.randomUUID()}`;
@@ -403,7 +451,7 @@ function collectPins(value: unknown): string[] {
 async function purchaseD1ExamPin(request: Request, env: Env) {
   const auth = await requireUser(request, env);
   if (!auth.user) return auth.response!;
-  if (env.CLOUDFLARE_WALLET_CUTOVER !== 'true' || env.TOPUPMATE_PURCHASES_ENABLED !== 'true') {
+  if (!livePurchasesReady(env)) {
     return json({ error: { code: 'EXAM_PURCHASES_DISABLED', message: 'Exam PIN purchases are temporarily unavailable. Your wallet has not been charged.' } }, 503);
   }
   const body = await request.json().catch(() => null) as { provider?: unknown; quantity?: unknown; ref?: unknown } | null;
@@ -464,7 +512,7 @@ async function purchaseD1ExamPin(request: Request, env: Env) {
 async function purchaseD1Airtime(request: Request, env: Env) {
   const auth = await requireUser(request, env);
   if (!auth.user) return auth.response!;
-  if (env.CLOUDFLARE_WALLET_CUTOVER !== 'true' || env.TOPUPMATE_PURCHASES_ENABLED !== 'true') {
+  if (!livePurchasesReady(env)) {
     return json({ error: { code: 'AIRTIME_PURCHASES_DISABLED', message: 'Airtime purchases are temporarily unavailable. Your wallet has not been charged.' } }, 503);
   }
   const body = await request.json().catch(() => null) as { network?: unknown; amount?: unknown; phone?: unknown; ref?: unknown; airtime_type?: unknown } | null;
@@ -574,20 +622,22 @@ async function catalog(_request: Request, env: Env, service: 'data' | 'network' 
 }
 
 async function cloudflareHealth(env: Env) {
+  const purchaseReady = livePurchasesReady(env);
+  const fundingReady = env.CLOUDFLARE_FUNDING_ENABLED === 'true' && flutterwaveReady(env);
   try {
     await env.DB.prepare('SELECT 1').first();
     return json({ ok: true, service: 'SamEduHub Cloudflare API', supplier: {
       provider: 'topupmate', configured: Boolean(env.TOPUPMATE_API_TOKEN && env.TOPUPMATE_API_BASE_URL),
-      purchaseEnabled: env.CLOUDFLARE_WALLET_CUTOVER === 'true' && env.TOPUPMATE_PURCHASES_ENABLED === 'true' && Boolean(env.TOPUPMATE_API_TOKEN && env.TOPUPMATE_API_BASE_URL), customerWalletConfigured: env.CLOUDFLARE_WALLET_CUTOVER === 'true',
+      purchaseEnabled: purchaseReady, paymentMode: env.FLW_MODE === 'test' || env.FLW_MODE === 'live' ? env.FLW_MODE : 'unconfigured', supplierMode: env.TOPUPMATE_MODE === 'sandbox' || env.TOPUPMATE_MODE === 'live' ? env.TOPUPMATE_MODE : 'unconfigured', customerWalletConfigured: env.CLOUDFLARE_WALLET_CUTOVER === 'true',
       transactionStoreConfigured: true, serverAuthConfigured: Boolean(env.FIREBASE_PROJECT_ID),
-      fundingEnabled: env.CLOUDFLARE_FUNDING_ENABLED === 'true',
+      fundingEnabled: fundingReady,
     } });
   } catch {
     return json({ ok: false, service: 'SamEduHub Cloudflare API', supplier: {
       provider: 'topupmate', configured: Boolean(env.TOPUPMATE_API_TOKEN && env.TOPUPMATE_API_BASE_URL),
-      purchaseEnabled: false, customerWalletConfigured: env.CLOUDFLARE_WALLET_CUTOVER === 'true',
+      purchaseEnabled: false, paymentMode: env.FLW_MODE === 'test' || env.FLW_MODE === 'live' ? env.FLW_MODE : 'unconfigured', supplierMode: env.TOPUPMATE_MODE === 'sandbox' || env.TOPUPMATE_MODE === 'live' ? env.TOPUPMATE_MODE : 'unconfigured', customerWalletConfigured: env.CLOUDFLARE_WALLET_CUTOVER === 'true',
       transactionStoreConfigured: false, serverAuthConfigured: Boolean(env.FIREBASE_PROJECT_ID),
-      fundingEnabled: env.CLOUDFLARE_FUNDING_ENABLED === 'true',
+      fundingEnabled: fundingReady,
     } }, 503);
   }
 }
