@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server/index.ts",
+    "dev:preview": "vite --mode preview --host 127.0.0.1",
     "build": "vite build --configLoader native",
     "preview": "vite preview --configLoader native",
     "start": "tsx server/index.ts",

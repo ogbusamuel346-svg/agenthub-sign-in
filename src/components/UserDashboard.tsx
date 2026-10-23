@@ -77,6 +77,11 @@ export function UserDashboard({ currentUser, onLogout, onHome, onNotify, onProfi
   const avatarLetter = firstName.charAt(0).toUpperCase();
 
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('wallet_status')) setActivePage('wallet');
+  }, []);
+
+  useEffect(() => {
     let active = true;
     setWalletLoading(true);
     getWalletBalance()
