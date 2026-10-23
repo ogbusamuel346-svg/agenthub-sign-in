@@ -44,6 +44,7 @@ export type ExamPurchase = {
 };
 
 export type ExamPurchaseHistoryItem = ExamPurchase & {
+  kind?: 'service_purchase' | 'wallet_funding';
   service?: string;
   product?: { id: string | number; provider: string };
   providerId?: string;
@@ -55,6 +56,8 @@ export type ExamPurchaseHistoryItem = ExamPurchase & {
   updatedAt: number;
   debitedAt: number | null;
   refundedAt: number | null;
+  creditedAt?: number | null;
+  providerTransactionId?: string | null;
 };
 
 export type TransactionStatusResponse = {

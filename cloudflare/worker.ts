@@ -214,8 +214,12 @@ async function getD1TransactionStatus(request: Request, env: Env) {
 async function listD1Transactions(request: Request, env: Env) {
   const auth = await requireUser(request, env);
   if (!auth.user) return auth.response!;
-  const result = await env.DB.prepare('SELECT reference, service, provider_id, provider_name, quantity, unit_price_minor, total_amount_minor, currency, status, provider_status, pins_json, failure_code, created_at, updated_at, debited_at, refunded_at FROM service_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50').bind(auth.user.uid).all<Record<string, unknown>>();
-  const transactions = result.results.map(row => ({
+  const [serviceResult, fundingResult] = await Promise.all([
+    env.DB.prepare('SELECT reference, service, provider_id, provider_name, quantity, unit_price_minor, total_amount_minor, currency, status, provider_status, pins_json, failure_code, created_at, updated_at, debited_at, refunded_at FROM service_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50').bind(auth.user.uid).all<Record<string, unknown>>(),
+    env.DB.prepare('SELECT tx_ref, amount_minor, currency, status, provider_transaction_id, failure_code, created_at, updated_at, credited_at FROM wallet_funding_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50').bind(auth.user.uid).all<Record<string, unknown>>(),
+  ]);
+  const serviceTransactions = serviceResult.results.map(row => ({
+    kind: 'service_purchase',
     reference: row.reference, service: row.service,
     product: { id: row.provider_id, provider: row.provider_name },
     providerId: row.provider_id, providerName: row.provider_name, quantity: row.quantity,
@@ -224,6 +228,31 @@ async function listD1Transactions(request: Request, env: Env) {
     pins: row.pins_json ? JSON.parse(String(row.pins_json)) : [], failureCode: row.failure_code || null,
     createdAt: row.created_at, updatedAt: row.updated_at, debitedAt: row.debited_at || null, refundedAt: row.refunded_at || null,
   }));
+  const fundingTransactions = fundingResult.results.map(row => ({
+    kind: 'wallet_funding',
+    reference: row.tx_ref,
+    service: 'wallet_funding',
+    product: { id: 'wallet', provider: 'Wallet top-up' },
+    providerId: 'wallet',
+    providerName: 'Wallet top-up',
+    quantity: 1,
+    unitPrice: Number(row.amount_minor) / 100,
+    totalAmount: Number(row.amount_minor) / 100,
+    currency: row.currency,
+    status: row.status === 'successful' ? 'successful' : row.status === 'failed' ? 'failed' : 'pending',
+    providerStatus: null,
+    pins: [],
+    failureCode: row.failure_code || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    debitedAt: null,
+    refundedAt: null,
+    creditedAt: row.credited_at || null,
+    providerTransactionId: row.provider_transaction_id || null,
+  }));
+  const transactions = [...serviceTransactions, ...fundingTransactions]
+    .sort((a, b) => Number(b.createdAt) - Number(a.createdAt))
+    .slice(0, 50);
   return json({ transactions });
 }
 
