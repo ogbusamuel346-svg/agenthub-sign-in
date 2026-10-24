@@ -6,6 +6,7 @@ import { getSupplierTransactionStatus, normalizeDataPlans, normalizeNetworks, no
 export interface Env {
   DB: {
     prepare(query: string): {
+      run(): Promise<unknown>;
       bind(...values: unknown[]): {
         first<T = unknown>(): Promise<T | null>;
         run(): Promise<unknown>;
@@ -125,7 +126,7 @@ async function adminOverview(request: Request, env: Env) {
   if (auth.user.admin !== true) return json({ error: { code: 'ADMIN_ACCESS_REQUIRED', message: 'You are not authorized to view the admin dashboard.' } }, 403);
 
   try {
-    const [users, wallet, funding, purchases, recentActivity] = await Promise.all([
+    const [users, wallet, funding, purchases, recentActivity, archived] = await Promise.all([
       env.DB.prepare('SELECT COUNT(*) AS total FROM users').first<{ total: number }>(),
       env.DB.prepare('SELECT COALESCE(SUM(balance_minor), 0) AS total_balance_minor FROM wallets').first<{ total_balance_minor: number }>(),
       env.DB.prepare('SELECT status, COUNT(*) AS count, COALESCE(SUM(amount_minor), 0) AS amount_minor FROM wallet_funding_transactions GROUP BY status ORDER BY status').all<Record<string, unknown>>(),
