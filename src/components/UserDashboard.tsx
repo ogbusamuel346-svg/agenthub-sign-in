@@ -9,6 +9,7 @@ import {
   GraduationCap,
   Headphones,
   Home,
+  LogOut,
   Menu,
   Radio,
   ReceiptText,
@@ -181,7 +182,10 @@ export function UserDashboard({ currentUser, onLogout, onHome, onNotify, onProfi
               <span className="hidden max-w-[130px] truncate text-[12px] font-bold text-[#092c6e] sm:inline">{currentUser.name}</span>
               <ChevronDown className="hidden h-4 w-4 text-[#123b84] sm:block" />
             </button>
-            <button type="button" onClick={onLogout} className="hidden text-xs font-semibold text-[#52709d] hover:text-[#e65353] xl:block">Sign out</button>
+            <button type="button" onClick={onLogout} aria-label="Sign out" title="Sign out" className="inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2 py-2 text-[11px] font-semibold text-[#52709d] transition hover:bg-rose-50 hover:text-[#e65353] sm:px-2.5 sm:text-xs">
+              <LogOut className="h-4 w-4" />
+              <span>Sign out</span>
+            </button>
           </div>
         </header>
 
