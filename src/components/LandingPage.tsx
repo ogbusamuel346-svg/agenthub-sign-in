@@ -10,17 +10,13 @@ import {
   Globe,
   Play,
   Check,
-  MessageCircle,
   FileText,
-  Mail,
 } from 'lucide-react';
 
 interface LandingPageProps {
   onSignIn: () => void;
   onSignUp: () => void;
   onSelectService: (serviceKey: 'data' | 'airtime' | 'exam-pins' | 'electricity') => void;
-  isFirebaseConfigured: boolean;
-  onOpenFirebaseModal: () => void;
 }
 
 const SERVICE_BY_TAB = {
@@ -34,8 +30,6 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   onSignIn,
   onSignUp,
   onSelectService,
-  isFirebaseConfigured,
-  onOpenFirebaseModal,
 }) => {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [selectedServiceTab, setSelectedServiceTab] = useState<'airtime' | 'data' | 'exam' | 'electricity'>('airtime');
@@ -45,6 +39,48 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const [openFaqIndex, setOpenFaqIndex] = useState<number | null>(null);
   const [legalModal, setLegalModal] = useState<'privacy' | 'terms' | 'refund' | null>(null);
   const [contactModalOpen, setContactModalOpen] = useState(false);
+  const [contactEmail, setContactEmail] = useState('');
+  const [contactReference, setContactReference] = useState('');
+  const [contactComplaint, setContactComplaint] = useState('');
+  const [contactWebsite, setContactWebsite] = useState('');
+  const [contactSubmitting, setContactSubmitting] = useState(false);
+  const [contactSubmitNotice, setContactSubmitNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  const openContactModal = () => {
+    setContactSubmitNotice(null);
+    setContactModalOpen(true);
+  };
+
+  const submitContactComplaint = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setContactSubmitting(true);
+    setContactSubmitNotice(null);
+    try {
+      const response = await fetch('/api/cloudflare/support/complaints', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: contactEmail.trim(),
+          reference: contactReference.trim(),
+          message: contactComplaint.trim(),
+          website: contactWebsite,
+        }),
+      });
+      const result = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+      if (!response.ok) throw new Error(result?.error?.message || 'We could not send your complaint. Please try again later.');
+      setContactSubmitNotice({ type: 'success', message: 'Your complaint has been sent to support. We’ll reply to your email.' });
+      setContactReference('');
+      setContactComplaint('');
+      setContactWebsite('');
+    } catch (error) {
+      setContactSubmitNotice({
+        type: 'error',
+        message: error instanceof Error ? error.message : 'We could not send your complaint. Please try again later.',
+      });
+    } finally {
+      setContactSubmitting(false);
+    }
+  };
 
   const scrollToSection = (id: string) => {
     setMobileMenuOpen(false);
@@ -73,19 +109,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
           <div className="flex items-center space-x-3 text-[11px]">
             <button
-              onClick={onOpenFirebaseModal}
-              className={`inline-flex items-center space-x-1.5 px-2.5 py-0.5 rounded-full border transition-all cursor-pointer ${
-                isFirebaseConfigured
-                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 hover:bg-emerald-500/30'
-                  : 'bg-[#ff9c2a]/20 text-[#ffbd70] border-[#ff9c2a]/40 hover:bg-[#ff9c2a]/30'
-              }`}
-            >
-              <span className={`w-1.5 h-1.5 rounded-full ${isFirebaseConfigured ? 'bg-emerald-400' : 'bg-[#ff9c2a]'}`} />
-              <span>{isFirebaseConfigured ? 'Firebase Live' : 'Firebase Setup (.env.local)'}</span>
-            </button>
-            <span className="text-slate-600">|</span>
-            <button
-              onClick={() => setContactModalOpen(true)}
+              onClick={openContactModal}
               className="text-[#ffbd70] hover:underline cursor-pointer"
             >
               24/7 Helpdesk
@@ -139,7 +163,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
               Services
             </button>
             <button
-              onClick={() => setContactModalOpen(true)}
+              onClick={openContactModal}
               className="hover:text-[#1a3fbd] transition-colors cursor-pointer text-[#475569]"
             >
               Contact
@@ -214,7 +238,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
             <button
               onClick={() => {
                 setMobileMenuOpen(false);
-                setContactModalOpen(true);
+                openContactModal();
               }}
               className="block w-full text-left font-semibold text-base text-[#475569]"
             >
@@ -708,7 +732,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                   </button>
                 </li>
                 <li>
-                  <button onClick={() => setContactModalOpen(true)} className="hover:text-white transition-colors cursor-pointer">
+                  <button onClick={openContactModal} className="hover:text-white transition-colors cursor-pointer">
                     Contact us
                   </button>
                 </li>
@@ -888,51 +912,89 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       {contactModalOpen && (
         <div
           style={{ zIndex: 1200 }}
-          className="fixed inset-0 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm"
+          className="fixed inset-0 flex items-center justify-center overflow-y-auto p-4 bg-black/75 backdrop-blur-sm"
         >
-          <div className="w-full max-w-lg bg-white rounded-3xl shadow-2xl p-6 sm:p-7 text-[#0f172a] space-y-4">
+          <div className="my-auto w-full max-w-lg bg-white rounded-3xl shadow-2xl p-6 sm:p-7 text-[#0f172a] space-y-4">
             <div className="flex items-center justify-between pb-3 border-b border-slate-200">
               <div className="flex items-center space-x-2">
                 <div className="w-8 h-8 rounded-lg bg-[#0d2b8e] text-[#ff9c2a] flex items-center justify-center font-bold">
                   S
                 </div>
-                <h3 className="text-lg font-black text-[#0f172a]">SamEduHub Helpdesk</h3>
+                <div>
+                  <h3 className="text-lg font-black text-[#0f172a]">Contact Support</h3>
+                  <p className="text-xs text-[#64748B]">Tell us what happened and we’ll help.</p>
+                </div>
               </div>
               <button
                 onClick={() => setContactModalOpen(false)}
+                aria-label="Close contact support"
                 className="p-1 rounded-md text-slate-400 hover:text-black cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            <div className="space-y-3 text-xs sm:text-sm">
-              <div className="p-3.5 rounded-2xl bg-[#f8fafc] border border-[#e2e8f0] flex items-start space-x-3">
-                <Mail className="w-5 h-5 text-[#1a3fbd] shrink-0 mt-0.5" />
-                <div>
-                  <div className="font-bold text-[#0f172a]">Email Support Desk</div>
-                  <div className="text-[#64748B]">support@sameduhub.com</div>
-                  <div className="text-[11px] text-slate-400">Response within 1 business hour</div>
-                </div>
+            <form onSubmit={submitContactComplaint} className="space-y-4">
+              <input
+                type="text"
+                name="website"
+                value={contactWebsite}
+                onChange={(event) => setContactWebsite(event.target.value)}
+                tabIndex={-1}
+                autoComplete="off"
+                aria-hidden="true"
+                className="absolute -left-[10000px] h-px w-px opacity-0"
+              />
+              <label className="block text-sm font-semibold text-[#173b79]">
+                Your email
+                <input
+                  type="email"
+                  required
+                  value={contactEmail}
+                  onChange={(event) => setContactEmail(event.target.value)}
+                  autoComplete="email"
+                  placeholder="you@example.com"
+                  className="mt-1.5 w-full rounded-xl border border-[#d9e5f5] px-4 py-3 text-sm font-normal text-[#0f172a] outline-none focus:border-[#1a3fbd] focus:ring-2 focus:ring-[#1a3fbd]/15"
+                />
+              </label>
+              <label className="block text-sm font-semibold text-[#173b79]">
+                Transaction reference <span className="font-normal text-[#64748B]">(optional)</span>
+                <input
+                  type="text"
+                  value={contactReference}
+                  onChange={(event) => setContactReference(event.target.value)}
+                  placeholder="Add this if your complaint is about a transaction"
+                  className="mt-1.5 w-full rounded-xl border border-[#d9e5f5] px-4 py-3 text-sm font-normal text-[#0f172a] outline-none focus:border-[#1a3fbd] focus:ring-2 focus:ring-[#1a3fbd]/15"
+                />
+              </label>
+              <label className="block text-sm font-semibold text-[#173b79]">
+                Complaint details
+                <textarea
+                  required
+                  minLength={10}
+                  rows={5}
+                  value={contactComplaint}
+                  onChange={(event) => setContactComplaint(event.target.value)}
+                  placeholder="Describe the issue and what you need help with"
+                  className="mt-1.5 w-full resize-y rounded-xl border border-[#d9e5f5] px-4 py-3 text-sm font-normal text-[#0f172a] outline-none focus:border-[#1a3fbd] focus:ring-2 focus:ring-[#1a3fbd]/15"
+                />
+              </label>
+              {contactSubmitNotice && (
+                <p role="status" className={contactSubmitNotice.type === 'success' ? 'rounded-xl bg-emerald-50 px-3 py-2 text-xs leading-relaxed text-emerald-800' : 'rounded-xl bg-rose-50 px-3 py-2 text-xs leading-relaxed text-rose-800'}>
+                  {contactSubmitNotice.message}
+                </p>
+              )}
+              <div className="flex items-center justify-between gap-3 pt-1">
+                <span className="text-[11px] text-[#64748B]">A support reply will go to your email.</span>
+                <button
+                  type="submit"
+                  disabled={contactSubmitting}
+                  className="rounded-full bg-[#1a3fbd] px-5 py-2.5 text-sm font-bold text-white transition hover:bg-[#0d2b8e]"
+                >
+                  {contactSubmitting ? 'Sending…' : 'Send complaint'}
+                </button>
               </div>
-
-              <div className="p-3.5 rounded-2xl bg-[#f8fafc] border border-[#e2e8f0] flex items-start space-x-3">
-                <MessageCircle className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
-                <div>
-                  <div className="font-bold text-[#0f172a]">WhatsApp Fast Assistance</div>
-                  <div className="text-[#64748B]">Available for active users & agents</div>
-                </div>
-              </div>
-            </div>
-
-            <div className="flex justify-end pt-2">
-              <button
-                onClick={() => setContactModalOpen(false)}
-                className="px-5 py-2 bg-[#1a3fbd] hover:bg-[#0d2b8e] text-white rounded-full font-bold text-xs cursor-pointer"
-              >
-                Close
-              </button>
-            </div>
+            </form>
           </div>
         </div>
       )}

@@ -15,3 +15,8 @@ CLOUDFLARE_WALLET_CUTOVER="false"
 
 # Optional return-to-app URL after Paystack payment.
 PAYSTACK_FRONTEND_RETURN_URL=""
+
+# Cloudflare Email Service uses the SUPPORT_MAILER Worker binding.
+# Onboard this sender domain in Cloudflare Email Service before sending.
+SUPPORT_EMAIL="support@sameduhub.com"
+SUPPORT_FROM_EMAIL="SamEduHub Support <support@sameduhub.com>"

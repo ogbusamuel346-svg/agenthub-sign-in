@@ -16,10 +16,20 @@
     "TOPUPMATE_MODE": "live",
     "CLOUDFLARE_WALLET_CUTOVER": "true",
     "CLOUDFLARE_FUNDING_ENABLED": "true",
+    "SUPPORT_EMAIL": "support@sameduhub.com",
+    "SUPPORT_FROM_EMAIL": "SamEduHub Support <support@sameduhub.com>",
     // Paystack can be tested with test credentials; TopupMate currently
     // targets its live API, so keep supplier purchases disabled until funded.
     "TOPUPMATE_PURCHASES_ENABLED": "false"
   },
+  "send_email": [
+    {
+      "name": "SUPPORT_MAILER",
+      "destination_address": "support@sameduhub.com",
+      "allowed_sender_addresses": ["support@sameduhub.com"],
+      "remote": true
+    }
+  ],
   "d1_databases": [
     {
       "binding": "DB",

@@ -12,7 +12,6 @@ import {
   Zap,
   Sparkles,
   Database,
-  Key,
   Home,
   Mail,
   LockKeyhole,
@@ -29,7 +28,7 @@ import {
   AuthTerms,
   GoogleAuthButton,
 } from './components/AuthUI';
-import { auth, isFirebaseConfigured, firebaseConfig, firebaseInitializationErrorCode } from './firebase';
+import { auth, isFirebaseConfigured } from './firebase';
 import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
@@ -73,7 +72,7 @@ class DashboardErrorBoundary extends React.Component<
           <AlertTriangle className="mx-auto h-10 w-10 text-rose-500" />
           <h1 className="mt-4 text-xl font-extrabold text-[#0c3275]">Dashboard could not be displayed</h1>
           <p className="mt-2 text-sm leading-relaxed text-[#587098]">A dashboard component encountered an error. Your account is still signed in; reload the page to try again.</p>
-          {this.state.errorMessage && <p className="mt-3 break-words rounded-lg bg-rose-50 px-3 py-2 text-left text-xs text-rose-700">Diagnostic: {this.state.errorMessage}</p>}
+
           <button type="button" onClick={() => window.location.reload()} className="mt-5 rounded-lg bg-[#155EEF] px-5 py-3 text-sm font-extrabold text-white hover:bg-[#0e4dcc]">Reload dashboard</button>
         </div>
       </div>
@@ -89,9 +88,6 @@ export default function App() {
   const [rememberMe, setRememberMe] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   const [toast, setToast] = useState<ToastData | null>(null);
-
-  const [showFirebaseModal, setShowFirebaseModal] = useState(false);
-  const firebaseAuthReady = Boolean(auth);
 
   // Forgot password state
   const [forgotEmail, setForgotEmail] = useState('');
@@ -222,7 +218,7 @@ export default function App() {
       case 'auth/popup-closed-by-user':
         return 'Sign-in popup was closed before completion.';
       default:
-        return err?.message || 'An error occurred during authentication. Please try again.';
+        return 'An error occurred during authentication. Please try again.';
     }
   };
 
@@ -237,7 +233,7 @@ export default function App() {
 
     if (isFirebaseConfigured && !auth) {
       setIsLoading(false);
-      showNotification('error', 'Firebase Unavailable', `Firebase Auth could not initialize${firebaseInitializationErrorCode ? ` (${firebaseInitializationErrorCode})` : ''}.`);
+      showNotification('error', 'Sign-in Unavailable', 'Account services could not be initialized. Please try again later.');
       return;
     }
 
@@ -328,7 +324,7 @@ export default function App() {
 
     if (isFirebaseConfigured && !auth) {
       setIsLoading(false);
-      showNotification('error', 'Firebase Unavailable', `Firebase Auth could not initialize${firebaseInitializationErrorCode ? ` (${firebaseInitializationErrorCode})` : ''}.`);
+      showNotification('error', 'Sign-in Unavailable', 'Account services could not be initialized. Please try again later.');
       return;
     }
 
@@ -446,91 +442,6 @@ export default function App() {
     return <div className="flex min-h-screen items-center justify-center bg-[#f4f8ff] text-sm font-semibold text-[#234577]">Checking your account…</div>;
   }
 
-  const renderFirebaseModal = () => {
-    if (!showFirebaseModal) return null;
-    return (
-      <div
-        style={{ zIndex: 1100 }}
-        className="fixed inset-0 flex items-center justify-center p-4 bg-slate-950/75 backdrop-blur-sm"
-      >
-        <div className="w-full max-w-xl bg-slate-900 border border-sky-700/80 rounded-2xl shadow-2xl p-6 text-white space-y-4">
-          <div className="flex items-center justify-between pb-3 border-b border-sky-800">
-            <div className="flex items-center space-x-2.5">
-              <div className="p-2 bg-amber-500/20 text-amber-400 rounded-lg">
-                <Key className="w-5 h-5" />
-              </div>
-              <div>
-                <h3 className="text-lg font-bold">Firebase Configuration</h3>
-                <p className="text-xs text-cyan-200">Connect your Firebase Authentication project</p>
-              </div>
-            </div>
-            <button
-              onClick={() => setShowFirebaseModal(false)}
-              className="p-1 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer"
-            >
-              <X className="w-5 h-5" />
-            </button>
-          </div>
-
-          <div className="space-y-3 text-xs">
-            <div className={`p-3.5 rounded-xl border flex items-start space-x-3 ${
-              firebaseAuthReady
-                ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-200'
-                : 'bg-amber-950/50 border-amber-500/40 text-amber-200'
-            }`}>
-              {firebaseAuthReady ? (
-                <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
-              ) : (
-                <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
-              )}
-              <div>
-                <p className="font-bold text-sm">
-                  {firebaseAuthReady
-                    ? 'Firebase SDK is initialized and connected!'
-                    : 'Firebase credentials not yet provided'}
-                </p>
-                <p className="mt-1 leading-relaxed opacity-90">
-                  {firebaseAuthReady
-                    ? `Project ID: "${firebaseConfig.projectId}". Logins and sign-ups connect to your live Firebase Auth.`
-                    : 'The project is ready! Simply paste your Firebase web config keys into .env.local to enable real sign-in, registration, and password recovery.'}
-                </p>
-              </div>
-            </div>
-
-            <div className="bg-slate-950 p-4 rounded-xl border border-sky-900 space-y-2">
-              <span className="font-bold text-cyan-300 uppercase tracking-wider text-[11px] block">
-                Quick Setup Steps:
-              </span>
-              <ol className="list-decimal list-inside space-y-1.5 text-slate-300">
-                <li>Open <a href="https://console.firebase.google.com" target="_blank" rel="noreferrer" className="text-cyan-400 underline font-semibold">Firebase Console</a> and select your project.</li>
-                <li>Click <strong>Project Settings (Gear icon)</strong> &gt; <strong>General</strong> &gt; <strong>Your apps</strong> &gt; <strong>Web App (&lt;/&gt;)</strong>.</li>
-                <li>In Firebase Console, ensure <strong>Authentication &gt; Sign-in method &gt; Email/Password</strong> is enabled.</li>
-                <li>Open <code className="text-cyan-300 bg-sky-950 px-1.5 py-0.5 rounded">.env.local</code> in your project root and paste the values.</li>
-              </ol>
-            </div>
-
-            <div className="bg-slate-950 p-3 rounded-xl border border-sky-900 font-mono text-[11px] text-cyan-200 overflow-x-auto">
-              <div className="text-slate-400"># Located in .env.local:</div>
-              <div>VITE_FIREBASE_API_KEY="{firebaseConfig.apiKey ? '••••••••' : ''}"</div>
-              <div>VITE_FIREBASE_AUTH_DOMAIN="{firebaseConfig.authDomain || ''}"</div>
-              <div>VITE_FIREBASE_PROJECT_ID="{firebaseConfig.projectId || ''}"</div>
-              <div>VITE_FIREBASE_APP_ID="{firebaseConfig.appId || ''}"</div>
-            </div>
-          </div>
-
-          <div className="flex justify-end pt-2">
-            <button
-              onClick={() => setShowFirebaseModal(false)}
-              className="px-4 py-2 bg-sky-700 hover:bg-sky-600 text-white rounded-lg font-semibold text-xs cursor-pointer"
-            >
-              Got it
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  };
-
   // 1. PUBLIC LANDING PAGE VIEW
   if (view === 'landing') {
     return (
@@ -540,10 +451,7 @@ export default function App() {
           onSignIn={() => setView('signin')}
           onSignUp={() => setView('signup')}
           onSelectService={handleSelectService}
-          isFirebaseConfigured={firebaseAuthReady}
-          onOpenFirebaseModal={() => setShowFirebaseModal(true)}
         />
-        {renderFirebaseModal()}
       </>
     );
   }
@@ -727,17 +635,6 @@ export default function App() {
                   <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
                   <span className="font-semibold text-slate-600">SamEduHub</span>
                   <span className="text-slate-400">sameduhub/sign-in</span>
-                  <button
-                    onClick={() => setShowFirebaseModal(true)}
-                    className={`ml-2 inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold border transition-all cursor-pointer ${
-                      firebaseAuthReady
-                        ? 'bg-emerald-50 text-emerald-700 border-emerald-300 hover:bg-emerald-100'
-                        : 'bg-amber-50 text-amber-700 border-amber-300 hover:bg-amber-100'
-                    }`}
-                  >
-                    <Database className="w-3 h-3" />
-                    <span>{firebaseAuthReady ? 'Firebase: Connected' : 'Firebase: Setup'}</span>
-                  </button>
                 </div>
                 <div className="flex flex-wrap items-center gap-1.5">
                   <button onClick={() => setView('landing')} className="px-2 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded text-[11px] font-medium cursor-pointer flex items-center space-x-1">
@@ -755,9 +652,6 @@ export default function App() {
           </div>
         )}
       </div>
-
-      {/* Firebase Credentials Modal */}
-      {renderFirebaseModal()}
     </div>
   );
 

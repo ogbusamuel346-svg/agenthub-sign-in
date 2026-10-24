@@ -71,7 +71,7 @@ export async function apiRequest<T>(url: string, init?: RequestInit, options: Ap
   if (options.authenticated) {
     const firebaseUser = await getFirebaseUser();
     if (!firebaseUser) {
-      throw makeError(options, 'Your Firebase session is no longer available. Please sign in again.', 401, 'AUTHENTICATION_REQUIRED');
+      throw makeError(options, 'Your session has expired. Please sign in again.', 401, 'AUTHENTICATION_REQUIRED');
     }
     headers.set('Authorization', `Bearer ${await firebaseUser.getIdToken()}`);
   }

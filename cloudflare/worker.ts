@@ -29,6 +29,17 @@ export interface Env {
   PAYSTACK_FRONTEND_RETURN_URL?: string;
   CLOUDFLARE_WALLET_CUTOVER?: string;
   CLOUDFLARE_FUNDING_ENABLED?: string;
+  SUPPORT_EMAIL?: string;
+  SUPPORT_FROM_EMAIL?: string;
+  SUPPORT_MAILER: {
+    send(message: {
+      to: string;
+      from: string;
+      subject: string;
+      text: string;
+      replyTo?: string;
+    }): Promise<{ messageId: string }>;
+  };
 }
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
@@ -744,6 +755,85 @@ async function catalog(_request: Request, env: Env, service: 'data' | 'network' 
   }
 }
 
+async function submitSupportComplaint(request: Request, env: Env) {
+  const origin = request.headers.get('Origin');
+  if (origin && origin !== new URL(request.url).origin) {
+    return json({ error: { code: 'INVALID_ORIGIN', message: 'The complaint could not be submitted.' } }, 403);
+  }
+
+  const contentLength = Number(request.headers.get('Content-Length') || 0);
+  if (contentLength > 10_000) {
+    return json({ error: { code: 'COMPLAINT_TOO_LARGE', message: 'Keep the complaint under 5,000 characters.' } }, 413);
+  }
+
+  const body = await request.json().catch(() => null) as {
+    email?: unknown;
+    reference?: unknown;
+    message?: unknown;
+    website?: unknown;
+  } | null;
+  if (!body) return json({ error: { code: 'INVALID_COMPLAINT', message: 'Enter your email and complaint details.' } }, 400);
+
+  // Quietly accept bot submissions without sending mail.
+  if (typeof body.website === 'string' && body.website.trim()) return json({ ok: true });
+
+  const email = typeof body.email === 'string' ? body.email.trim() : '';
+  const reference = typeof body.reference === 'string' ? body.reference.trim() : '';
+  const message = typeof body.message === 'string' ? body.message.trim() : '';
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return json({ error: { code: 'INVALID_EMAIL', message: 'Enter a valid email address.' } }, 400);
+  }
+  if (reference.length > 160 || /[\r\n]/.test(reference)) {
+    return json({ error: { code: 'INVALID_REFERENCE', message: 'The transaction reference is too long.' } }, 400);
+  }
+  if (message.length < 10 || message.length > 5_000) {
+    return json({ error: { code: 'INVALID_COMPLAINT', message: 'Complaint details must be between 10 and 5,000 characters.' } }, 400);
+  }
+  if (!env.SUPPORT_EMAIL || !env.SUPPORT_FROM_EMAIL) {
+    return json({ error: { code: 'SUPPORT_EMAIL_NOT_CONFIGURED', message: 'Support email is temporarily unavailable. Please try again later.' } }, 503);
+  }
+
+  try {
+    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ip));
+    const ipHash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+    const now = Date.now();
+    const windowStart = Math.floor(now / 600_000) * 600_000;
+    const rate = await env.DB.prepare(
+      'INSERT INTO support_complaint_rate_limits (ip_hash, window_start, request_count, updated_at) VALUES (?, ?, 1, ?) ON CONFLICT(ip_hash) DO UPDATE SET request_count = CASE WHEN support_complaint_rate_limits.window_start < excluded.window_start THEN 1 ELSE support_complaint_rate_limits.request_count + 1 END, window_start = excluded.window_start, updated_at = excluded.updated_at RETURNING request_count'
+    ).bind(ipHash, windowStart, now).first<{ request_count: number }>();
+    if (Number(rate?.request_count || 0) > 3) {
+      return json({ error: { code: 'SUPPORT_RATE_LIMITED', message: 'Too many complaints were sent from this connection. Please try again in a few minutes.' } }, 429);
+    }
+  } catch {
+    return json({ error: { code: 'SUPPORT_UNAVAILABLE', message: 'Support email is temporarily unavailable. Please try again later.' } }, 503);
+  }
+
+  const subject = 'SamEduHub support complaint' + (reference ? ' - ' + reference : '');
+  const text = [
+    'Customer email: ' + email,
+    'Transaction reference: ' + (reference || 'Not provided'),
+    '',
+    'Complaint:',
+    message,
+  ].join('\n');
+
+  try {
+    await env.SUPPORT_MAILER.send({
+      from: env.SUPPORT_FROM_EMAIL,
+      to: env.SUPPORT_EMAIL,
+      replyTo: email,
+      subject,
+      text,
+    });
+    return json({ ok: true });
+  } catch (error) {
+    const code = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : 'unknown';
+    console.error('Cloudflare Email Service rejected a support complaint:', code);
+    return json({ error: { code: 'SUPPORT_EMAIL_FAILED', message: 'We could not send your complaint. Please try again later.' } }, 502);
+  }
+}
+
 async function cloudflareHealth(env: Env) {
   const purchaseReady = livePurchasesReady(env);
   const fundingReady = env.CLOUDFLARE_FUNDING_ENABLED === 'true' && paystackReady(env);
@@ -792,6 +882,7 @@ const worker = {
       }
     }
     if (url.pathname === '/api/cloudflare/health' && request.method === 'GET') return cloudflareHealth(env);
+    if (url.pathname === '/api/cloudflare/support/complaints' && request.method === 'POST') return submitSupportComplaint(request, env);
 
     if (url.pathname === '/api/cloudflare/readiness' && request.method === 'GET') return authenticatedReadiness(request, env);
     if (url.pathname === '/api/cloudflare/reconciliation' && request.method === 'GET') return accountReconciliation(request, env);

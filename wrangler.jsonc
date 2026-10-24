@@ -18,8 +18,18 @@
     "TOPUPMATE_REQUEST_TIMEOUT_MS": "15000",
     "CLOUDFLARE_WALLET_CUTOVER": "true",
     "CLOUDFLARE_FUNDING_ENABLED": "true",
-    "TOPUPMATE_PURCHASES_ENABLED": "true"
+    "TOPUPMATE_PURCHASES_ENABLED": "true",
+    "SUPPORT_EMAIL": "support@sameduhub.com",
+    "SUPPORT_FROM_EMAIL": "SamEduHub Support <support@sameduhub.com>"
   },
+  "send_email": [
+    {
+      "name": "SUPPORT_MAILER",
+      "destination_address": "support@sameduhub.com",
+      "allowed_sender_addresses": ["support@sameduhub.com"],
+      "remote": true
+    }
+  ],
   "d1_databases": [
     {
       "binding": "DB",
