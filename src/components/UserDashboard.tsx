@@ -77,6 +77,7 @@ export function UserDashboard({ currentUser, onLogout, onHome, onNotify, onProfi
   const [recentTransactions, setRecentTransactions] = useState<ExamPurchaseHistoryItem[]>([]);
   const [transactionsLoading, setTransactionsLoading] = useState(true);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [adminCheckComplete, setAdminCheckComplete] = useState(false);
   const firstName = currentUser.name.trim().split(/\s+/)[0] || 'Samuel';
   const avatarLetter = firstName.charAt(0).toUpperCase();
   const visibleSidebarItems = isAdmin ? [...sidebarItems, { id: 'admin' as const, label: 'Admin overview', icon: ShieldCheck }] : sidebarItems;
@@ -84,13 +85,21 @@ export function UserDashboard({ currentUser, onLogout, onHome, onNotify, onProfi
   useEffect(() => {
     let active = true;
     setIsAdmin(false);
+    setAdminCheckComplete(false);
     const loadAdminClaim = async () => {
       try {
         const user = auth?.currentUser;
-        const result = user ? await user.getIdTokenResult() : null;
-        if (active) setIsAdmin(result?.claims.admin === true);
+        const result = user ? await user.getIdTokenResult(true) : null;
+        const hasAdminClaim = result?.claims.admin === true;
+        if (active) {
+          setIsAdmin(hasAdminClaim);
+          setAdminCheckComplete(true);
+        }
       } catch {
-        if (active) setIsAdmin(false);
+        if (active) {
+          setIsAdmin(false);
+          setAdminCheckComplete(true);
+        }
       }
     };
     void loadAdminClaim();
@@ -103,6 +112,7 @@ export function UserDashboard({ currentUser, onLogout, onHome, onNotify, onProfi
   }, []);
 
   useEffect(() => {
+    if (!adminCheckComplete || isAdmin) return;
     let active = true;
     setWalletLoading(true);
     getWalletBalance()
@@ -110,9 +120,10 @@ export function UserDashboard({ currentUser, onLogout, onHome, onNotify, onProfi
       .catch(() => { if (active) setWalletBalance(null); })
       .finally(() => { if (active) setWalletLoading(false); });
     return () => { active = false; };
-  }, [currentUser.email]);
+  }, [currentUser.email, adminCheckComplete, isAdmin]);
 
   useEffect(() => {
+    if (!adminCheckComplete || isAdmin) return;
     let active = true;
     setTransactionsLoading(true);
     getTransactions()
@@ -120,7 +131,7 @@ export function UserDashboard({ currentUser, onLogout, onHome, onNotify, onProfi
       .catch(() => { if (active) setRecentTransactions([]); })
       .finally(() => { if (active) setTransactionsLoading(false); });
     return () => { active = false; };
-  }, [currentUser.email]);
+  }, [currentUser.email, adminCheckComplete, isAdmin]);
 
   const handleSidebarClick = (page: DashboardPageId) => {
     setSidebarOpen(false);
@@ -130,6 +141,38 @@ export function UserDashboard({ currentUser, onLogout, onHome, onNotify, onProfi
   const handleServiceClick = (page: DashboardPageId) => {
     setActivePage(page);
   };
+
+  if (!adminCheckComplete) {
+    return <div className="flex min-h-screen items-center justify-center bg-[#f2f6fc] text-sm font-semibold text-[#456694]">Checking your account…</div>;
+  }
+
+  if (isAdmin) {
+    return (
+      <div className="min-h-screen bg-[#f2f6fc] text-[#102b57]">
+        <header className="border-b border-[#d9e3f1] bg-[#082b66] text-white shadow-md">
+          <div className="mx-auto flex min-h-[76px] max-w-[1200px] flex-wrap items-center justify-between gap-4 px-4 py-3 sm:px-7">
+            <div className="flex items-center gap-3">
+              <img src="/assets/img/sameduhub-logo-transparent.png" alt="SamEduHub" className="h-10 w-10 object-contain" />
+              <div><p className="text-base font-extrabold leading-tight">SamEduHub</p><p className="mt-1 text-[10px] font-extrabold uppercase tracking-[0.2em] text-[#ffad62]">Admin Console</p></div>
+            </div>
+            <div className="flex items-center gap-2 sm:gap-4">
+              <span className="hidden max-w-[220px] truncate text-xs text-blue-100 sm:block">{currentUser.email}</span>
+              <button type="button" onClick={onLogout} className="inline-flex items-center gap-2 rounded-lg bg-[#ff7b17] px-3 py-2 text-xs font-extrabold text-white hover:bg-[#f06c09]"><LogOut className="h-4 w-4" /><span className="hidden sm:inline">Sign out</span></button>
+            </div>
+          </div>
+        </header>
+        <main className="mx-auto max-w-[1100px] space-y-5 px-4 py-7 sm:px-7">
+          <div className="rounded-xl border border-[#d9e3f1] bg-white p-5 shadow-sm sm:p-7">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div><p className="text-[11px] font-extrabold uppercase tracking-[0.16em] text-[#155eef]">Staff workspace</p><h1 className="mt-1 text-2xl font-extrabold text-[#082b66] sm:text-3xl">Administration</h1><p className="mt-1 text-sm text-[#617795]">Monitor SamEduHub accounts, wallet totals and recent transactions.</p></div>
+              <span className="inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-2 text-[11px] font-extrabold text-emerald-800"><ShieldCheck className="h-4 w-4" />Authorized admin</span>
+            </div>
+          </div>
+          <DashboardPageContent page="admin" currentUser={currentUser} onNavigate={setActivePage} onNotify={onNotify} onProfileUpdated={onProfileUpdated} />
+        </main>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#f4f8ff] text-[#0b2b69]">
