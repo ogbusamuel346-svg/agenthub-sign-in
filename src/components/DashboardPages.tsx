@@ -16,6 +16,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { auth } from '../firebase';
+import { apiRequest } from '../services/apiClient';
 import { updateProfile } from 'firebase/auth';
 import { describeApiError, getExamPurchaseHistory, getIntegrationHealth, getLiveDataPlans, getLiveElectricityProviders, getLiveExamProducts, getLiveNetworks, getTransactionDelivery, getTransactionStatus, getTransactions, purchaseAirtime, purchaseData, purchaseElectricity, purchaseExamPin, verifyElectricityCustomer, type ExamPurchaseHistoryItem, type TopupmateExamProduct, type TopupmateNetwork, type TopupmatePlan, type TopupmateUtilityProvider } from '../services/smeApi';
 import { createWalletFunding, getWalletBalance, getWalletFundingStatus } from '../services/wallet';
@@ -29,7 +30,8 @@ export type DashboardPageId =
   | 'wallet'
   | 'transactions'
   | 'profile'
-  | 'support';
+  | 'support'
+  | 'admin';
 
 interface DashboardUser {
   email: string;
@@ -56,6 +58,7 @@ const pageMeta: Record<Exclude<DashboardPageId, 'dashboard'>, { title: string; d
   transactions: { title: 'Transaction History', description: 'Search your account activity and download available receipts.', icon: FileText },
   profile: { title: 'Profile', description: 'Manage the account details supported by your authentication provider.', icon: UserRound },
   support: { title: 'Help & Support', description: 'Contact SamEduHub or submit a complaint with a transaction reference.', icon: Headphones },
+  admin: { title: 'Admin overview', description: 'Read-only operational summary for authorized administrators.', icon: ShieldCheck },
 };
 
 function StatusBanner({ status }: { status: Status }) {
@@ -582,6 +585,47 @@ function SupportPage({ onNavigate }: DashboardPageProps) {
   return <PageFrame page="support" onNavigate={onNavigate}><div className="grid gap-5 lg:grid-cols-[.8fr_1.2fr]"><div className="space-y-5"><div className="rounded-lg border border-[#d9e5f5] bg-white p-5 shadow-sm"><h2 className="text-lg font-extrabold text-[#0c3275]">Contact options</h2><div className="mt-5 space-y-3"><a href="mailto:support@sameduhub.com" className="flex items-center gap-3 rounded-lg border border-[#edf2f8] p-3 text-sm font-bold text-[#173b79] transition hover:border-[#9bbcf5] hover:text-[#155EEF]"><Mail className="h-5 w-5 text-[#155EEF]" />support@sameduhub.com<ChevronRight className="ml-auto h-4 w-4" /></a><a href="mailto:support@sameduhub.com?subject=SamEduHub%20support" className="flex items-center gap-3 rounded-lg border border-[#edf2f8] p-3 text-sm font-bold text-[#173b79] transition hover:border-[#9bbcf5] hover:text-[#155EEF]"><Headphones className="h-5 w-5 text-[#155EEF]" />Email customer support<ChevronRight className="ml-auto h-4 w-4" /></a></div></div><IntegrationNotice capability="support tickets and complaint submission" /></div><FormCard title="Submit a complaint" onSubmit={submit}><Field label="Transaction reference" hint="Required so support can locate the relevant transaction after the endpoint is connected."><input value={reference} onChange={e => setReference(e.target.value)} className={inputClass} placeholder="Enter reference" /></Field><div className="mt-4"><Field label="Complaint details"><textarea value={message} onChange={e => setMessage(e.target.value)} className={`${inputClass} min-h-[150px] resize-y`} placeholder="Describe the issue" /></Field></div><div className="mt-5"><SubmitButton>Submit complaint</SubmitButton></div></FormCard></div><StatusBanner status={status} /></PageFrame>;
 }
 
+type AdminOverview = {
+  totalUsers: number;
+  walletLiabilityMinor: number;
+  fundingByStatus: Array<{ status: string; count: number; amount_minor: number }>;
+  purchasesByStatus: Array<{ status: string; count: number; amount_minor: number }>;
+  recentActivity: Array<{ kind: string; reference: string; email: string; status: string; amount_minor: number; created_at: number }>;
+};
+
+function AdminPage({ onNavigate }: DashboardPageProps) {
+  const [overview, setOverview] = useState<AdminOverview | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    void apiRequest<{ overview: AdminOverview }>('/api/cloudflare/admin/overview', undefined, { authenticated: true })
+      .then((result) => { if (active) setOverview(result.overview); })
+      .catch((reason: unknown) => { if (active) setError(reason instanceof Error ? reason.message : 'Admin data is unavailable.'); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, []);
+
+  const money = (minor: number) => `₦${(minor / 100).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const cardClass = 'rounded-lg border border-[#d9e5f5] bg-white p-5 shadow-sm';
+  const groups: Array<{ title: string; rows?: AdminOverview['fundingByStatus'] }> = [
+    { title: 'Wallet funding', rows: overview?.fundingByStatus },
+    { title: 'Product purchases', rows: overview?.purchasesByStatus },
+  ];
+  return <PageFrame page="admin" onNavigate={onNavigate}>
+    <div className="grid gap-4 sm:grid-cols-2">
+      <div className={cardClass}><p className="text-xs font-bold text-[#6c82a4]">Registered users</p><p className="mt-2 text-3xl font-extrabold text-[#0c3275]">{loading ? '—' : overview?.totalUsers.toLocaleString() ?? '—'}</p></div>
+      <div className={cardClass}><p className="text-xs font-bold text-[#6c82a4]">Total wallet balances</p><p className="mt-2 text-3xl font-extrabold text-[#0c3275]">{loading ? '—' : overview ? money(overview.walletLiabilityMinor) : '—'}</p><p className="mt-1 text-[11px] text-[#7890b2]">Aggregate recorded customer balance</p></div>
+    </div>
+    {error && <div className="rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800" role="alert">{error}</div>}
+    <div className="grid gap-5 lg:grid-cols-2">
+      {groups.map(({ title, rows }) => <section key={title} className={cardClass}><h2 className="font-extrabold text-[#0c3275]">{title}</h2>{loading ? <p className="mt-4 text-sm text-[#6c82a4]">Loading…</p> : !rows?.length ? <p className="mt-4 text-sm text-[#6c82a4]">No activity recorded.</p> : <div className="mt-3 divide-y divide-[#edf2f8]">{rows.map(row => <div key={row.status} className="flex items-center justify-between gap-3 py-3 text-sm"><span className="font-semibold capitalize text-[#456694]">{row.status} <span className="text-xs text-[#7890b2]">({row.count})</span></span><span className="font-bold text-[#173b79]">{money(row.amount_minor)}</span></div>)}</div>}</section>)}
+    </div>
+    <section className={`${cardClass} overflow-hidden`}><h2 className="font-extrabold text-[#0c3275]">Recent activity</h2>{loading ? <p className="mt-4 text-sm text-[#6c82a4]">Loading…</p> : !overview?.recentActivity.length ? <p className="mt-4 text-sm text-[#6c82a4]">No activity recorded.</p> : <div className="mt-4 overflow-x-auto"><table className="w-full min-w-[650px] text-left text-xs"><thead className="border-b border-[#edf2f8] text-[#6c82a4]"><tr><th className="px-3 py-3">Type</th><th className="px-3 py-3">Account</th><th className="px-3 py-3">Amount</th><th className="px-3 py-3">Status</th><th className="px-3 py-3">Reference</th></tr></thead><tbody>{overview.recentActivity.map((row) => <tr key={`${row.kind}:${row.reference}`} className="border-b border-[#f1f5fa] last:border-0"><td className="px-3 py-3 font-semibold capitalize text-[#173b79]">{row.kind.replaceAll('_', ' ')}</td><td className="px-3 py-3 text-[#456694]">{row.email}</td><td className="px-3 py-3 text-[#456694]">{money(row.amount_minor)}</td><td className="px-3 py-3 font-semibold capitalize text-[#456694]">{row.status}</td><td className="px-3 py-3 font-mono text-[10px] text-[#456694]">{row.reference}</td></tr>)}</tbody></table></div>}</section>
+  </PageFrame>;
+}
+
 export function DashboardPageContent(props: DashboardPageProps & { page: Exclude<DashboardPageId, 'dashboard'> }) {
   switch (props.page) {
     case 'airtime': return <AirtimePage {...props} />;
@@ -592,5 +636,6 @@ export function DashboardPageContent(props: DashboardPageProps & { page: Exclude
     case 'transactions': return <TransactionsPage {...props} />;
     case 'profile': return <ProfilePage {...props} />;
     case 'support': return <SupportPage {...props} />;
+    case 'admin': return <AdminPage {...props} />;
   }
 }

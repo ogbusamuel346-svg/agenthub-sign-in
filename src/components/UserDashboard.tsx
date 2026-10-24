@@ -14,6 +14,7 @@ import {
   Radio,
   ReceiptText,
   Smartphone,
+  ShieldCheck,
   UserRound,
   Wallet,
   X,
@@ -22,6 +23,7 @@ import {
 import { DashboardPageContent, type DashboardPageId } from './DashboardPages';
 import { getWalletBalance } from '../services/wallet';
 import { getTransactions, type ExamPurchaseHistoryItem } from '../services/smeApi';
+import { auth } from '../firebase';
 
 interface DashboardUser {
   email: string;
@@ -74,8 +76,26 @@ export function UserDashboard({ currentUser, onLogout, onHome, onNotify, onProfi
   const [walletLoading, setWalletLoading] = useState(true);
   const [recentTransactions, setRecentTransactions] = useState<ExamPurchaseHistoryItem[]>([]);
   const [transactionsLoading, setTransactionsLoading] = useState(true);
+  const [isAdmin, setIsAdmin] = useState(false);
   const firstName = currentUser.name.trim().split(/\s+/)[0] || 'Samuel';
   const avatarLetter = firstName.charAt(0).toUpperCase();
+  const visibleSidebarItems = isAdmin ? [...sidebarItems, { id: 'admin' as const, label: 'Admin overview', icon: ShieldCheck }] : sidebarItems;
+
+  useEffect(() => {
+    let active = true;
+    setIsAdmin(false);
+    const loadAdminClaim = async () => {
+      try {
+        const user = auth?.currentUser;
+        const result = user ? await user.getIdTokenResult() : null;
+        if (active) setIsAdmin(result?.claims.admin === true);
+      } catch {
+        if (active) setIsAdmin(false);
+      }
+    };
+    void loadAdminClaim();
+    return () => { active = false; };
+  }, [currentUser.email]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -134,7 +154,7 @@ export function UserDashboard({ currentUser, onLogout, onHome, onNotify, onProfi
         </div>
 
         <nav className="flex-1 space-y-1 px-4 py-4">
-          {sidebarItems.map((item) => {
+          {visibleSidebarItems.map((item) => {
             const Icon = item.icon;
             return (
               <button

@@ -44,7 +44,7 @@ export interface Env {
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
 
-type FirebaseClaims = { user_id?: unknown };
+type FirebaseClaims = { user_id?: unknown; admin?: unknown };
 const firebaseKeys = createRemoteJWKSet(new URL('https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com'));
 
 async function firebaseUser(request: Request, projectId: string) {
@@ -60,7 +60,7 @@ async function firebaseUser(request: Request, projectId: string) {
     });
     const claims = payload as typeof payload & FirebaseClaims;
     if (typeof claims.sub !== 'string' || !claims.sub || claims.sub !== claims.user_id || typeof claims.iat !== 'number' || claims.iat > now + 60) return null;
-    return { uid: claims.sub, email: typeof claims.email === 'string' ? claims.email : undefined, emailVerified: claims.email_verified === true, name: typeof claims.name === 'string' ? claims.name : undefined };
+    return { uid: claims.sub, email: typeof claims.email === 'string' ? claims.email : undefined, emailVerified: claims.email_verified === true, name: typeof claims.name === 'string' ? claims.name : undefined, admin: claims.admin === true };
   } catch {
     return null;
   }
@@ -117,6 +117,35 @@ async function requireUser(request: Request, env: Env) {
   const user = await firebaseUser(request, env.FIREBASE_PROJECT_ID);
   if (!user) return { response: json({ error: { code: 'AUTHENTICATION_REQUIRED', message: 'A valid Firebase ID token is required.' } }, 401) };
   return { user };
+}
+
+async function adminOverview(request: Request, env: Env) {
+  const auth = await requireUser(request, env);
+  if (!auth.user) return auth.response!;
+  if (auth.user.admin !== true) return json({ error: { code: 'ADMIN_ACCESS_REQUIRED', message: 'You are not authorized to view the admin dashboard.' } }, 403);
+
+  try {
+    const [users, wallet, funding, purchases, recentActivity] = await Promise.all([
+      env.DB.prepare('SELECT COUNT(*) AS total FROM users').first<{ total: number }>(),
+      env.DB.prepare('SELECT COALESCE(SUM(balance_minor), 0) AS total_balance_minor FROM wallets').first<{ total_balance_minor: number }>(),
+      env.DB.prepare('SELECT status, COUNT(*) AS count, COALESCE(SUM(amount_minor), 0) AS amount_minor FROM wallet_funding_transactions GROUP BY status ORDER BY status').all<Record<string, unknown>>(),
+      env.DB.prepare('SELECT status, COUNT(*) AS count, COALESCE(SUM(total_amount_minor), 0) AS amount_minor FROM service_transactions GROUP BY status ORDER BY status').all<Record<string, unknown>>(),
+      env.DB.prepare("SELECT activity.kind, activity.reference, activity.email, activity.status, activity.amount_minor, activity.created_at FROM (SELECT 'wallet_funding' AS kind, f.tx_ref AS reference, u.email AS email, f.status AS status, f.amount_minor AS amount_minor, f.created_at AS created_at FROM wallet_funding_transactions f JOIN users u ON u.id=f.user_id UNION ALL SELECT s.service AS kind, s.reference AS reference, u.email AS email, s.status AS status, s.total_amount_minor AS amount_minor, s.created_at AS created_at FROM service_transactions s JOIN users u ON u.id=s.user_id) activity ORDER BY activity.created_at DESC LIMIT 10").all<Record<string, unknown>>(),
+    ]);
+    const safeNumber = (value: unknown) => Number.isSafeInteger(Number(value)) && Number(value) >= 0 ? Number(value) : 0;
+    return json({
+      ok: true,
+      overview: {
+        totalUsers: safeNumber(users?.total),
+        walletLiabilityMinor: safeNumber(wallet?.total_balance_minor),
+        fundingByStatus: funding.results,
+        purchasesByStatus: purchases.results,
+        recentActivity: recentActivity.results,
+      },
+    });
+  } catch {
+    return json({ error: { code: 'ADMIN_OVERVIEW_UNAVAILABLE', message: 'Admin dashboard data is temporarily unavailable.' } }, 503);
+  }
 }
 
 async function getD1Wallet(request: Request, env: Env) {
@@ -887,6 +916,7 @@ const worker = {
     if (url.pathname === '/api/cloudflare/readiness' && request.method === 'GET') return authenticatedReadiness(request, env);
     if (url.pathname === '/api/cloudflare/reconciliation' && request.method === 'GET') return accountReconciliation(request, env);
     if (url.pathname === '/api/cloudflare/profile' && request.method === 'POST') return syncFirebaseProfile(request, env);
+    if (url.pathname === '/api/cloudflare/admin/overview' && request.method === 'GET') return adminOverview(request, env);
     if (url.pathname === '/api/cloudflare/wallet' && request.method === 'GET') return getD1Wallet(request, env);
     const fundingMatch = url.pathname.match(/^\/api\/cloudflare\/wallet\/funding\/([^/]+)$/);
     if (fundingMatch && request.method === 'GET') return getD1Funding(request, env, decodeURIComponent(fundingMatch[1]));
