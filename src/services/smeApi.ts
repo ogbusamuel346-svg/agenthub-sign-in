@@ -8,6 +8,7 @@ export type TopupmatePlan = {
   category: string;
   validity: string;
   price: number | null;
+  available: boolean;
 };
 
 export type TopupmateNetwork = {
@@ -119,7 +120,39 @@ export function getLiveNetworks() {
 }
 
 export function purchaseData(input: { network: string | number; data_plan: string | number; phone: string }) {
-  return request<{ reference: string; status: string }>('data', { method: 'POST', body: JSON.stringify(input) }, true);
+  const ref = getDataPurchaseReference(input);
+  const result = import.meta.env.VITE_CLOUDFLARE_API === 'true'
+    ? apiRequest<{ reference: string; status: string; message?: string }>('/api/cloudflare/services/data/purchase', { method: 'POST', body: JSON.stringify({ ...input, ref }) }, { authenticated: true })
+    : request<{ reference: string; status: string; message?: string }>('data', { method: 'POST', body: JSON.stringify(input) }, true);
+  return result.then((purchase) => {
+    if (purchase.status === 'successful' || purchase.status === 'failed') {
+      try { sessionStorage.removeItem(dataPurchaseAttemptKey); } catch { /* session storage may be unavailable */ }
+    }
+    return purchase;
+  }).catch((error: unknown) => {
+    if (error instanceof ApiClientError && (error.status === 409 || error.code === 'TOPUPMATE_PURCHASE_FAILED')) {
+      try { sessionStorage.removeItem(dataPurchaseAttemptKey); } catch { /* session storage may be unavailable */ }
+    }
+    throw error;
+  });
+}
+
+const dataPurchaseAttemptKey = 'sameduhub:data-purchase-attempt';
+
+function getDataPurchaseReference(input: { network: string | number; data_plan: string | number; phone: string }) {
+  const fingerprint = `${input.network}:${input.data_plan}:${input.phone}`;
+  try {
+    const saved = sessionStorage.getItem(dataPurchaseAttemptKey);
+    if (saved) {
+      const attempt = JSON.parse(saved) as { fingerprint?: unknown; reference?: unknown };
+      if (attempt.fingerprint === fingerprint && typeof attempt.reference === 'string') return attempt.reference;
+    }
+    const reference = `data-${crypto.randomUUID()}`;
+    sessionStorage.setItem(dataPurchaseAttemptKey, JSON.stringify({ fingerprint, reference }));
+    return reference;
+  } catch {
+    return `data-${crypto.randomUUID()}`;
+  }
 }
 
 export function purchaseAirtime(input: { network: string | number; amount: number; phone: string }) {

@@ -591,24 +591,107 @@ type AdminOverview = {
   fundingByStatus: Array<{ status: string; count: number; amount_minor: number }>;
   purchasesByStatus: Array<{ status: string; count: number; amount_minor: number }>;
   recentActivity: Array<{ kind: string; reference: string; email: string; status: string; amount_minor: number; created_at: number }>;
+  archivedActivityCount: number;
+};
+
+type AdminProductPrice = {
+  service: 'data' | 'exampin';
+  key: string;
+  productId: string;
+  networkId: string;
+  name: string;
+  available: boolean;
+  supplierPriceMinor: number | null;
+  sellingPriceMinor: number | null;
+  hasOverride: boolean;
 };
 
 function AdminPage() {
   const [overview, setOverview] = useState<AdminOverview | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [products, setProducts] = useState<AdminProductPrice[]>([]);
+  const [productsLoading, setProductsLoading] = useState(true);
+  const [productsError, setProductsError] = useState('');
+  const [draftPrices, setDraftPrices] = useState<Record<string, string>>({});
+  const [savingProduct, setSavingProduct] = useState('');
+  const [pricingNotice, setPricingNotice] = useState('');
+  const [historyAction, setHistoryAction] = useState(false);
+  const [historyNotice, setHistoryNotice] = useState('');
 
   useEffect(() => {
     let active = true;
     void apiRequest<{ overview: AdminOverview }>('/api/cloudflare/admin/overview', undefined, { authenticated: true })
       .then((result) => {
-        if (!result?.overview) throw new Error('Admin summary data is unavailable because the local Cloudflare Worker is not running.');
+        if (!result?.overview) throw new Error('The Cloudflare admin data service did not return a dashboard summary.');
         if (active) setOverview(result.overview);
       })
       .catch((reason: unknown) => { if (active) setError(reason instanceof Error ? reason.message : 'Admin data is unavailable.'); })
       .finally(() => { if (active) setLoading(false); });
+    void apiRequest<{ products: AdminProductPrice[] }>('/api/cloudflare/admin/products', undefined, { authenticated: true })
+      .then((result) => {
+        if (!Array.isArray(result?.products)) throw new Error('The Cloudflare product-pricing service is not available in this preview.');
+        if (!active) return;
+        setProducts(result.products);
+        setDraftPrices(Object.fromEntries(result.products.map(product => [product.key, product.sellingPriceMinor === null ? '' : (product.sellingPriceMinor / 100).toFixed(2)])));
+      })
+      .catch((reason: unknown) => { if (active) setProductsError(reason instanceof Error ? reason.message : 'Product prices are unavailable.'); })
+      .finally(() => { if (active) setProductsLoading(false); });
     return () => { active = false; };
   }, []);
+
+  const saveProductPrice = async (product: AdminProductPrice) => {
+    const rawPrice = draftPrices[product.key]?.trim() || '';
+    if (!/^\d+(?:\.\d{1,2})?$/.test(rawPrice)) {
+      setProductsError('Enter a price with up to two decimal places.');
+      return;
+    }
+    const value = Number(rawPrice);
+    const priceMinor = Math.round(value * 100);
+    if (!Number.isSafeInteger(priceMinor) || priceMinor < 1 || priceMinor > 100_000_000) {
+      setProductsError('Enter a price between ₦0.01 and ₦1,000,000.');
+      return;
+    }
+    setSavingProduct(product.key);
+    setProductsError('');
+    setPricingNotice('');
+    try {
+      await apiRequest('/api/cloudflare/admin/products/prices', { method: 'POST', body: JSON.stringify({ service: product.service, productId: product.productId, networkId: product.networkId, priceMinor }) }, { authenticated: true });
+      setProducts(items => items.map(item => item.key === product.key ? { ...item, sellingPriceMinor: priceMinor, hasOverride: true } : item));
+      setPricingNotice(`Selling price saved for ${product.name}.`);
+    } catch (reason) {
+      setProductsError(reason instanceof Error ? reason.message : 'The price could not be saved.');
+    } finally { setSavingProduct(''); }
+  };
+
+  const resetProductPrice = async (product: AdminProductPrice) => {
+    setSavingProduct(product.key);
+    setProductsError('');
+    setPricingNotice('');
+    try {
+      await apiRequest('/api/cloudflare/admin/products/prices', { method: 'POST', body: JSON.stringify({ service: product.service, productId: product.productId, networkId: product.networkId, priceMinor: null }) }, { authenticated: true });
+      setProducts(items => items.map(item => item.key === product.key ? { ...item, sellingPriceMinor: item.supplierPriceMinor, hasOverride: false } : item));
+      setDraftPrices(prices => ({ ...prices, [product.key]: product.supplierPriceMinor === null ? '' : (product.supplierPriceMinor / 100).toFixed(2) }));
+      setPricingNotice(`TopupMate price restored for ${product.name}.`);
+    } catch (reason) {
+      setProductsError(reason instanceof Error ? reason.message : 'The TopupMate price could not be restored.');
+    } finally { setSavingProduct(''); }
+  };
+
+  const changeHistoryVisibility = async (restore: boolean) => {
+    if (!restore && !window.confirm('Hide all wallet funding and purchase entries from the admin recent-activity list? Customer histories and financial records will remain unchanged.')) return;
+    setHistoryAction(true);
+    setHistoryNotice('');
+    try {
+      await apiRequest(`/api/cloudflare/admin/activity/${restore ? 'restore' : 'archive'}`, { method: 'POST', body: JSON.stringify({}) }, { authenticated: true });
+      const refreshed = await apiRequest<{ overview: AdminOverview }>('/api/cloudflare/admin/overview', undefined, { authenticated: true });
+      if (!refreshed?.overview) throw new Error('Admin activity was updated, but the dashboard summary could not be refreshed.');
+      setOverview(refreshed.overview);
+      setHistoryNotice(restore ? 'Archived activity is visible in the admin dashboard again.' : 'Transaction entries were hidden from this admin view. Financial and customer records are unchanged.');
+    } catch (reason) {
+      setHistoryNotice(reason instanceof Error ? reason.message : 'The admin activity history could not be updated.');
+    } finally { setHistoryAction(false); }
+  };
 
   const money = (minor: number) => `₦${(minor / 100).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   const cardClass = 'rounded-lg border border-[#d9e5f5] bg-white p-5 shadow-sm';
@@ -625,7 +708,16 @@ function AdminPage() {
     <div className="grid gap-5 lg:grid-cols-2">
       {groups.map(({ title, rows }) => <section key={title} className={cardClass}><h2 className="font-extrabold text-[#0c3275]">{title}</h2>{loading ? <p className="mt-4 text-sm text-[#6c82a4]">Loading…</p> : !rows?.length ? <p className="mt-4 text-sm text-[#6c82a4]">No activity recorded.</p> : <div className="mt-3 divide-y divide-[#edf2f8]">{rows.map(row => <div key={row.status} className="flex items-center justify-between gap-3 py-3 text-sm"><span className="font-semibold capitalize text-[#456694]">{row.status} <span className="text-xs text-[#7890b2]">({row.count})</span></span><span className="font-bold text-[#173b79]">{money(row.amount_minor)}</span></div>)}</div>}</section>)}
     </div>
-    <section className={`${cardClass} overflow-hidden`}><h2 className="font-extrabold text-[#0c3275]">Recent activity</h2>{loading ? <p className="mt-4 text-sm text-[#6c82a4]">Loading…</p> : !overview?.recentActivity.length ? <p className="mt-4 text-sm text-[#6c82a4]">No activity recorded.</p> : <div className="mt-4 overflow-x-auto"><table className="w-full min-w-[650px] text-left text-xs"><thead className="border-b border-[#edf2f8] text-[#6c82a4]"><tr><th className="px-3 py-3">Type</th><th className="px-3 py-3">Account</th><th className="px-3 py-3">Amount</th><th className="px-3 py-3">Status</th><th className="px-3 py-3">Reference</th></tr></thead><tbody>{overview.recentActivity.map((row) => <tr key={`${row.kind}:${row.reference}`} className="border-b border-[#f1f5fa] last:border-0"><td className="px-3 py-3 font-semibold capitalize text-[#173b79]">{row.kind.replaceAll('_', ' ')}</td><td className="px-3 py-3 text-[#456694]">{row.email}</td><td className="px-3 py-3 text-[#456694]">{money(row.amount_minor)}</td><td className="px-3 py-3 font-semibold capitalize text-[#456694]">{row.status}</td><td className="px-3 py-3 font-mono text-[10px] text-[#456694]">{row.reference}</td></tr>)}</tbody></table></div>}</section>
+    <section className={`${cardClass} overflow-hidden`}>
+      <div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="font-extrabold text-[#0c3275]">Recent activity</h2><p className="mt-1 text-[11px] text-[#7890b2]">Clear hides entries from this admin view; customer histories and financial records are retained.</p></div><div className="flex gap-2">{overview?.archivedActivityCount ? <button type="button" disabled={historyAction} onClick={() => void changeHistoryVisibility(true)} className="rounded-lg border border-[#c9daf3] px-3 py-2 text-xs font-bold text-[#155eef] disabled:opacity-50">{historyAction ? 'Restoring…' : 'Restore history'}</button> : null}<button type="button" disabled={historyAction || loading || !overview?.recentActivity.length} onClick={() => void changeHistoryVisibility(false)} className="rounded-lg border border-rose-200 px-3 py-2 text-xs font-bold text-rose-700 hover:bg-rose-50 disabled:opacity-50">{historyAction ? 'Clearing…' : 'Clear history'}</button></div></div>
+      {historyNotice && <p className="mt-3 text-xs font-semibold text-[#456694]" role="status">{historyNotice}</p>}
+      {loading ? <p className="mt-4 text-sm text-[#6c82a4]">Loading…</p> : !overview?.recentActivity.length ? <p className="mt-4 text-sm text-[#6c82a4]">No recent activity shown.</p> : <div className="mt-4 overflow-x-auto"><table className="w-full min-w-[650px] text-left text-xs"><thead className="border-b border-[#edf2f8] text-[#6c82a4]"><tr><th className="px-3 py-3">Type</th><th className="px-3 py-3">Account</th><th className="px-3 py-3">Amount</th><th className="px-3 py-3">Status</th><th className="px-3 py-3">Reference</th></tr></thead><tbody>{overview.recentActivity.map((row) => <tr key={`${row.kind}:${row.reference}`} className="border-b border-[#f1f5fa] last:border-0"><td className="px-3 py-3 font-semibold capitalize text-[#173b79]">{row.kind.replaceAll('_', ' ')}</td><td className="px-3 py-3 text-[#456694]">{row.email}</td><td className="px-3 py-3 text-[#456694]">{money(row.amount_minor)}</td><td className="px-3 py-3 font-semibold capitalize text-[#456694]">{row.status}</td><td className="px-3 py-3 font-mono text-[10px] text-[#456694]">{row.reference}</td></tr>)}</tbody></table></div>}
+    </section>
+    <section className={`${cardClass} overflow-hidden`}>
+      <div><h2 className="font-extrabold text-[#0c3275]">Product prices</h2><p className="mt-1 text-xs text-[#6c82a4]">Set retail prices for catalogued data plans and Exam PINs. Cloudflare enforces these prices when it charges the wallet; the TopupMate supplier price remains available for comparison.</p></div>
+      {productsError && <p className="mt-3 text-xs font-semibold text-rose-700" role="alert">{productsError}</p>}{pricingNotice && <p className="mt-3 text-xs font-semibold text-emerald-700" role="status">{pricingNotice}</p>}
+      {productsLoading ? <p className="mt-4 text-sm text-[#6c82a4]">Loading TopupMate products…</p> : products.length ? <div className="mt-4 overflow-x-auto"><table className="w-full min-w-[760px] text-left text-xs"><thead className="border-b border-[#edf2f8] text-[#6c82a4]"><tr><th className="px-3 py-3">Product</th><th className="px-3 py-3">Supplier price</th><th className="px-3 py-3">Customer price (NGN)</th><th className="px-3 py-3">Action</th></tr></thead><tbody>{products.map(product => <tr key={product.key} className="border-b border-[#f1f5fa] last:border-0"><td className="px-3 py-3 font-semibold text-[#173b79]">{product.name}<span className={`ml-2 rounded-full px-2 py-1 text-[9px] font-bold ${product.available ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{product.available ? 'Available' : 'Unavailable'}</span></td><td className="px-3 py-3 text-[#456694]">{product.supplierPriceMinor === null ? 'Not provided' : money(product.supplierPriceMinor)}</td><td className="px-3 py-3"><input aria-label={`Selling price for ${product.name}`} type="number" min="0.01" max="1000000" step="0.01" value={draftPrices[product.key] ?? ''} onChange={event => setDraftPrices(prices => ({ ...prices, [product.key]: event.target.value }))} className="w-36 rounded-lg border border-[#d6e1f0] px-3 py-2 text-sm text-[#173b79] outline-none focus:border-[#155eef]" /></td><td className="px-3 py-3"><div className="flex gap-2"><button type="button" disabled={savingProduct === product.key || !product.available} onClick={() => void saveProductPrice(product)} className="rounded-lg bg-[#155eef] px-3 py-2 font-bold text-white disabled:opacity-50">{savingProduct === product.key ? 'Saving…' : 'Save price'}</button>{product.hasOverride && <button type="button" disabled={savingProduct === product.key} onClick={() => void resetProductPrice(product)} className="rounded-lg border border-[#c9daf3] px-3 py-2 font-bold text-[#155eef] disabled:opacity-50">Use supplier price</button>}</div></td></tr>)}</tbody></table></div> : !productsError ? <p className="mt-4 text-sm text-[#6c82a4]">No products returned by TopupMate.</p> : null}
+    </section>
   </div>;
 }
 

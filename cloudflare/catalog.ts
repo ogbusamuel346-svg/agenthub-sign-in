@@ -39,6 +39,8 @@ function normalizePlan(value: unknown) {
   const id = firstValue(value, ['id', 'planid', 'plan_id', 'planId']);
   if (id === undefined) return null;
   const network = firstValue(value, ['networkid', 'network_id', 'networkId', 'network']);
+  const status = asString(firstValue(value, ['status', 'state', 'availability']), '');
+  const available = typeof value.active === 'boolean' ? value.active : !status || /^(on|active|available|enabled|success|successful)$/i.test(status);
   return {
     id: typeof id === 'number' ? id : String(id),
     network: typeof network === 'number' ? network : network === undefined ? null : String(network),
@@ -47,6 +49,7 @@ function normalizePlan(value: unknown) {
     category: asString(firstValue(value, ['type', 'category', 'plantype', 'plan_type', 'planType']), 'Uncategorised'),
     validity: asString(firstValue(value, ['validity', 'validity_period', 'validityPeriod', 'duration', 'day']), 'Not provided'),
     price: asNumber(firstValue(value, ['user_price', 'userPrice', 'price', 'amount'])),
+    available,
   };
 }
 

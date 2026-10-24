@@ -130,7 +130,8 @@ async function adminOverview(request: Request, env: Env) {
       env.DB.prepare('SELECT COALESCE(SUM(balance_minor), 0) AS total_balance_minor FROM wallets').first<{ total_balance_minor: number }>(),
       env.DB.prepare('SELECT status, COUNT(*) AS count, COALESCE(SUM(amount_minor), 0) AS amount_minor FROM wallet_funding_transactions GROUP BY status ORDER BY status').all<Record<string, unknown>>(),
       env.DB.prepare('SELECT status, COUNT(*) AS count, COALESCE(SUM(total_amount_minor), 0) AS amount_minor FROM service_transactions GROUP BY status ORDER BY status').all<Record<string, unknown>>(),
-      env.DB.prepare("SELECT activity.kind, activity.reference, activity.email, activity.status, activity.amount_minor, activity.created_at FROM (SELECT 'wallet_funding' AS kind, f.tx_ref AS reference, u.email AS email, f.status AS status, f.amount_minor AS amount_minor, f.created_at AS created_at FROM wallet_funding_transactions f JOIN users u ON u.id=f.user_id UNION ALL SELECT s.service AS kind, s.reference AS reference, u.email AS email, s.status AS status, s.total_amount_minor AS amount_minor, s.created_at AS created_at FROM service_transactions s JOIN users u ON u.id=s.user_id) activity ORDER BY activity.created_at DESC LIMIT 10").all<Record<string, unknown>>(),
+      env.DB.prepare("SELECT activity.kind, activity.reference, activity.email, activity.status, activity.amount_minor, activity.created_at FROM (SELECT 'wallet_funding' AS kind, f.tx_ref AS reference, f.user_id AS user_id, u.email AS email, f.status AS status, f.amount_minor AS amount_minor, f.created_at AS created_at FROM wallet_funding_transactions f JOIN users u ON u.id=f.user_id UNION ALL SELECT s.service AS kind, s.reference AS reference, s.user_id AS user_id, u.email AS email, s.status AS status, s.total_amount_minor AS amount_minor, s.created_at AS created_at FROM service_transactions s JOIN users u ON u.id=s.user_id) activity WHERE NOT EXISTS (SELECT 1 FROM admin_activity_archives a WHERE a.user_id=activity.user_id AND a.activity_kind=activity.kind AND a.reference=activity.reference) ORDER BY activity.created_at DESC LIMIT 10").all<Record<string, unknown>>(),
+      env.DB.prepare('SELECT COUNT(*) AS total FROM admin_activity_archives').first<{ total: number }>(),
     ]);
     const safeNumber = (value: unknown) => Number.isSafeInteger(Number(value)) && Number(value) >= 0 ? Number(value) : 0;
     return json({
@@ -141,10 +142,131 @@ async function adminOverview(request: Request, env: Env) {
         fundingByStatus: funding.results,
         purchasesByStatus: purchases.results,
         recentActivity: recentActivity.results,
+        archivedActivityCount: safeNumber(archived?.total),
       },
     });
   } catch {
     return json({ error: { code: 'ADMIN_OVERVIEW_UNAVAILABLE', message: 'Admin dashboard data is temporarily unavailable.' } }, 503);
+  }
+}
+
+async function adminArchiveActivity(request: Request, env: Env, restore: boolean) {
+  const auth = await requireUser(request, env);
+  if (!auth.user) return auth.response!;
+  if (auth.user.admin !== true) return json({ error: { code: 'ADMIN_ACCESS_REQUIRED', message: 'You are not authorized to manage admin activity history.' } }, 403);
+  try {
+    if (restore) {
+      await env.DB.prepare('DELETE FROM admin_activity_archives').run();
+      return json({ ok: true, archivedActivityCount: 0 });
+    }
+    const now = Date.now();
+    await env.DB.prepare("INSERT OR IGNORE INTO admin_activity_archives (user_id, activity_kind, reference, archived_by, archived_at) SELECT user_id, 'wallet_funding', tx_ref, ?, ? FROM wallet_funding_transactions UNION ALL SELECT user_id, service, reference, ?, ? FROM service_transactions").bind(auth.user.uid, now, auth.user.uid, now).run();
+    const archived = await env.DB.prepare('SELECT COUNT(*) AS total FROM admin_activity_archives').first<{ total: number }>();
+    return json({ ok: true, archivedActivityCount: Number(archived?.total || 0) });
+  } catch {
+    return json({ error: { code: 'ADMIN_HISTORY_UNAVAILABLE', message: 'Admin activity history could not be updated.' } }, 503);
+  }
+}
+
+async function adminProducts(request: Request, env: Env) {
+  const auth = await requireUser(request, env);
+  if (!auth.user) return auth.response!;
+  if (auth.user.admin !== true) return json({ error: { code: 'ADMIN_ACCESS_REQUIRED', message: 'You are not authorized to manage product pricing.' } }, 403);
+  try {
+    const [dataPayload, examPayload, overrides] = await Promise.all([
+      topupmateRequest(env, '/services/?service=data'),
+      topupmateRequest(env, '/services/?service=exampin'),
+      env.DB.prepare('SELECT service, product_id, network_id, product_name, price_minor FROM product_price_overrides').all<{ service: string; product_id: string; network_id: string; product_name: string; price_minor: number }>(),
+    ]);
+    const overrideByKey = new Map(overrides.results.map(row => [priceOverrideKey(row.service, row.product_id, row.network_id), row]));
+    const dataProducts = normalizeDataPlans(dataPayload).map(product => {
+      const networkId = String(product.network ?? '');
+      const productId = String(product.id);
+      const override = overrideByKey.get(priceOverrideKey('data', productId, networkId));
+      return {
+        service: 'data',
+        key: priceOverrideKey('data', productId, networkId),
+        productId,
+        networkId,
+        name: `${product.networkLabel} — ${product.name} (${product.validity})`,
+        available: product.available,
+        supplierPriceMinor: product.price === null ? null : Math.round(product.price * 100),
+        sellingPriceMinor: override?.price_minor ?? (product.price === null ? null : Math.round(product.price * 100)),
+        hasOverride: Boolean(override),
+      };
+    });
+    const examProducts = normalizeExamProducts(examPayload).map(product => {
+      const productId = String(product.id);
+      const override = overrideByKey.get(priceOverrideKey('exampin', productId));
+      return {
+        service: 'exampin',
+        key: priceOverrideKey('exampin', productId),
+        productId,
+        networkId: '',
+        name: product.provider,
+        available: product.available,
+        supplierPriceMinor: product.price === null ? null : Math.round(product.price * 100),
+        sellingPriceMinor: override?.price_minor ?? (product.price === null ? null : Math.round(product.price * 100)),
+        hasOverride: Boolean(override),
+      };
+    });
+    return json({ products: [...dataProducts, ...examProducts] });
+  } catch {
+    return json({ error: { code: 'ADMIN_PRODUCTS_UNAVAILABLE', message: 'Product prices could not be loaded from TopupMate.' } }, 502);
+  }
+}
+
+async function applyExamPriceOverrides(env: Env, products: ReturnType<typeof normalizeExamProducts>) {
+  const overrides = await env.DB.prepare("SELECT product_id, price_minor FROM product_price_overrides WHERE service='exampin'").all<{ product_id: string; price_minor: number }>();
+  const overrideById = new Map(overrides.results.map(row => [row.product_id, row.price_minor]));
+  return products.map(product => {
+    const priceMinor = overrideById.get(String(product.id));
+    return priceMinor === undefined ? product : { ...product, price: Number(priceMinor) / 100 };
+  });
+}
+
+function priceOverrideKey(service: string, productId: string, networkId = '') {
+  return `${service}:${networkId}:${productId}`;
+}
+
+async function applyDataPriceOverrides(env: Env, products: ReturnType<typeof normalizeDataPlans>) {
+  const overrides = await env.DB.prepare("SELECT product_id, network_id, price_minor FROM product_price_overrides WHERE service='data'").all<{ product_id: string; network_id: string; price_minor: number }>();
+  const overrideByKey = new Map(overrides.results.map(row => [priceOverrideKey('data', row.product_id, row.network_id), row.price_minor]));
+  return products.map(product => {
+    const priceMinor = overrideByKey.get(priceOverrideKey('data', String(product.id), String(product.network ?? '')));
+    return priceMinor === undefined ? product : { ...product, price: Number(priceMinor) / 100 };
+  });
+}
+
+async function updateAdminProductPrice(request: Request, env: Env) {
+  const auth = await requireUser(request, env);
+  if (!auth.user) return auth.response!;
+  if (auth.user.admin !== true) return json({ error: { code: 'ADMIN_ACCESS_REQUIRED', message: 'You are not authorized to edit product pricing.' } }, 403);
+  const body = await request.json().catch(() => null) as { service?: unknown; productId?: unknown; networkId?: unknown; priceMinor?: unknown } | null;
+  const service = body?.service;
+  const productId = typeof body?.productId === 'string' ? body.productId.trim() : '';
+  const networkId = typeof body?.networkId === 'string' ? body.networkId.trim() : '';
+  const priceMinor = body?.priceMinor;
+  if (!['data', 'exampin'].includes(String(service)) || !productId || productId.length > 100 || networkId.length > 100 || (service === 'exampin' && networkId) || (priceMinor !== null && (!Number.isSafeInteger(priceMinor) || Number(priceMinor) < 1 || Number(priceMinor) > 100_000_000))) {
+    return json({ error: { code: 'INVALID_PRODUCT_PRICE', message: 'Enter a valid product and price between ₦0.01 and ₦1,000,000.' } }, 400);
+  }
+  try {
+    const catalogue = service === 'data'
+      ? normalizeDataPlans(await topupmateRequest(env, '/services/?service=data'))
+      : normalizeExamProducts(await topupmateRequest(env, '/services/?service=exampin'));
+    const product = service === 'data'
+      ? (catalogue as ReturnType<typeof normalizeDataPlans>).find(item => String(item.id) === productId && String(item.network ?? '') === networkId)
+      : (catalogue as ReturnType<typeof normalizeExamProducts>).find(item => String(item.id) === productId);
+    if (!product) return json({ error: { code: 'PRODUCT_NOT_FOUND', message: 'The selected product is no longer in the TopupMate catalogue.' } }, 404);
+    const productName = service === 'data' ? `${(product as ReturnType<typeof normalizeDataPlans>[number]).networkLabel} — ${(product as ReturnType<typeof normalizeDataPlans>[number]).name}` : (product as ReturnType<typeof normalizeExamProducts>[number]).provider;
+    if (priceMinor === null) {
+      await env.DB.prepare('DELETE FROM product_price_overrides WHERE service=? AND product_id=? AND network_id=?').bind(service, productId, networkId).run();
+      return json({ ok: true, productId, hasOverride: false, sellingPriceMinor: product.price === null ? null : Math.round(product.price * 100) });
+    }
+    await env.DB.prepare('INSERT INTO product_price_overrides (service, product_id, network_id, product_name, price_minor, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(service, product_id, network_id) DO UPDATE SET product_name=excluded.product_name, price_minor=excluded.price_minor, updated_by=excluded.updated_by, updated_at=excluded.updated_at').bind(service, productId, networkId, productName, Number(priceMinor), auth.user.uid, Date.now()).run();
+    return json({ ok: true, productId, hasOverride: true, sellingPriceMinor: Number(priceMinor) });
+  } catch {
+    return json({ error: { code: 'PRODUCT_PRICE_UPDATE_FAILED', message: 'The product price could not be saved.' } }, 503);
   }
 }
 
@@ -546,6 +668,70 @@ function collectPins(value: unknown): string[] {
   return [...found, ...Object.entries(record).filter(([key]) => !direct.includes(key)).flatMap(([, item]) => collectPins(item))];
 }
 
+async function purchaseD1Data(request: Request, env: Env) {
+  const auth = await requireUser(request, env);
+  if (!auth.user) return auth.response!;
+  if (!livePurchasesReady(env)) return json({ error: { code: 'DATA_PURCHASES_DISABLED', message: 'Data purchases are temporarily unavailable. Your wallet has not been charged.' } }, 503);
+  const body = await request.json().catch(() => null) as { network?: unknown; data_plan?: unknown; phone?: unknown; ref?: unknown } | null;
+  const networkId = typeof body?.network === 'string' || typeof body?.network === 'number' ? String(body.network).trim() : '';
+  const planId = typeof body?.data_plan === 'string' || typeof body?.data_plan === 'number' ? String(body.data_plan).trim() : '';
+  const phone = typeof body?.phone === 'string' ? body.phone.replace(/[\s-]/g, '') : '';
+  const reference = typeof body?.ref === 'string' ? body.ref.trim() : '';
+  if (!networkId || networkId.length > 100 || !planId || planId.length > 100 || !/^0\d{10}$/.test(phone) || !/^[a-z0-9][a-z0-9_.:-]{5,120}$/i.test(reference)) {
+    return json({ error: { code: 'INVALID_REQUEST', message: 'Choose a data plan and enter a valid Nigerian phone number.' } }, 400);
+  }
+  let plan: ReturnType<typeof normalizeDataPlans>[number] | undefined;
+  try {
+    plan = normalizeDataPlans(await topupmateRequest(env, '/services/?service=data')).find(item => String(item.id) === planId && String(item.network ?? '') === networkId);
+  } catch {
+    return json({ error: { code: 'DATA_CATALOGUE_UNAVAILABLE', message: 'The live data plan list could not be checked.' } }, 502);
+  }
+  if (!plan?.available) return json({ error: { code: 'PRODUCT_NOT_AVAILABLE', message: 'The selected data plan is no longer available.' } }, 409);
+  let priceOverride: { price_minor: number } | null;
+  try {
+    priceOverride = await env.DB.prepare("SELECT price_minor FROM product_price_overrides WHERE service='data' AND product_id=? AND network_id=?").bind(planId, networkId).first<{ price_minor: number }>();
+  } catch {
+    return json({ error: { code: 'PRODUCT_PRICING_UNAVAILABLE', message: 'Data plan pricing is temporarily unavailable. Your wallet has not been charged.' } }, 503);
+  }
+  const retailPrice = priceOverride ? Number(priceOverride.price_minor) / 100 : plan.price;
+  if (!Number.isFinite(retailPrice) || retailPrice === null || retailPrice <= 0) return json({ error: { code: 'PRODUCT_NOT_AVAILABLE', message: 'The selected data plan has no valid price.' } }, 409);
+  const unitMinor = priceOverride ? Number(priceOverride.price_minor) : Math.round(retailPrice * 100);
+  const totalMinor = unitMinor;
+  if (!Number.isSafeInteger(totalMinor) || totalMinor <= 0) return json({ error: { code: 'INVALID_PRICE', message: 'The data plan price is invalid.' } }, 502);
+  const providerId = `${networkId}:${planId}`;
+  const providerName = `${plan.networkLabel} — ${plan.name}`;
+  const existing = await env.DB.prepare('SELECT service, provider_id, quantity, unit_price_minor, total_amount_minor, status FROM service_transactions WHERE user_id=? AND reference=?').bind(auth.user.uid, reference).first<Record<string, unknown>>();
+  if (existing) {
+    if (existing.service !== 'data' || String(existing.provider_id) !== providerId || Number(existing.quantity) !== 1) return json({ error: { code: 'REFERENCE_CONFLICT', message: 'This order reference belongs to another purchase.' } }, 409);
+    if (existing.status === 'failed') return json({ error: { code: 'PREVIOUS_ORDER_FAILED', message: 'This order failed and its wallet debit was refunded. Start a new order.' } }, 409);
+    return json({ reference, status: existing.status, plan: { id: planId, network: networkId, name: providerName }, unitPrice: Number(existing.unit_price_minor) / 100, totalAmount: Number(existing.total_amount_minor) / 100, message: 'This order reference has already been recorded.' }, existing.status === 'successful' ? 200 : 202);
+  }
+  const now = Date.now();
+  const entryId = `debit:${crypto.randomUUID()}`;
+  const debit = await env.DB.batch([
+    env.DB.prepare("INSERT INTO wallet_entries (id,user_id,reference,entry_type,amount_minor,created_at) SELECT ?,?,?, 'service_debit',?,? WHERE EXISTS (SELECT 1 FROM wallets WHERE user_id=? AND balance_minor>=?) ON CONFLICT(user_id,reference,entry_type) DO NOTHING").bind(entryId, auth.user.uid, reference, totalMinor, now, auth.user.uid, totalMinor),
+    env.DB.prepare('UPDATE wallets SET balance_minor=balance_minor-?,updated_at=? WHERE user_id=? AND balance_minor>=? AND EXISTS (SELECT 1 FROM wallet_entries WHERE id=? AND reference=?)').bind(totalMinor, now, auth.user.uid, totalMinor, entryId, reference),
+    env.DB.prepare("INSERT INTO service_transactions (user_id,reference,service,provider_id,provider_name,quantity,unit_price_minor,total_amount_minor,currency,status,created_at,updated_at,debited_at) SELECT ?,?,'data',?,?,1,?,?,'NGN','processing',?,?,? WHERE EXISTS (SELECT 1 FROM wallet_entries WHERE id=? AND reference=?) ON CONFLICT(user_id,reference) DO NOTHING").bind(auth.user.uid, reference, providerId, providerName, unitMinor, totalMinor, now, now, now, entryId, reference),
+  ]);
+  if (((debit[0] as { meta?: { changes?: number } }).meta?.changes || 0) !== 1) return json({ error: { code: 'INSUFFICIENT_WALLET_BALANCE', message: 'Your wallet balance is insufficient or this order was already claimed.' } }, 402);
+  let supplier: unknown;
+  try {
+    supplier = await topupmateRequest(env, '/data/', 'POST', { network: plan.network ?? networkId, data_plan: plan.id, phone, ref: reference });
+  } catch {
+    await env.DB.prepare("UPDATE service_transactions SET status='pending',failure_code='SUPPLIER_OUTCOME_UNCERTAIN',updated_at=? WHERE user_id=? AND reference=? AND status='processing'").bind(Date.now(), auth.user.uid, reference).run();
+    return json({ reference, status: 'pending', plan: { id: planId, network: networkId, name: providerName }, unitPrice: retailPrice, totalAmount: retailPrice, message: 'Your data purchase is awaiting supplier confirmation. Check its status before submitting again.' }, 202);
+  }
+  const providerStatus = getSupplierTransactionStatus(supplier);
+  if (providerStatus === 'failed') {
+    const refundRequest = new Request(request.url, { method: 'POST', headers: request.headers, body: JSON.stringify({ reference, failureCode: 'TOPUPMATE_PURCHASE_FAILED' }) });
+    await refundD1Service(refundRequest, env);
+    return json({ error: { code: 'TOPUPMATE_PURCHASE_FAILED', message: 'The data purchase failed. Your wallet was refunded.' } }, 502);
+  }
+  const status = providerStatus === 'successful' ? 'successful' : 'pending';
+  await env.DB.prepare('UPDATE service_transactions SET status=?,provider_status=?,updated_at=? WHERE user_id=? AND reference=?').bind(status, providerStatus, Date.now(), auth.user.uid, reference).run();
+  return json({ reference, status, plan: { id: planId, network: networkId, name: providerName }, unitPrice: retailPrice, totalAmount: retailPrice, message: status === 'successful' ? 'Data delivery was confirmed by the supplier.' : 'Your data purchase is awaiting supplier confirmation.' }, status === 'successful' ? 200 : 202);
+}
+
 async function purchaseD1ExamPin(request: Request, env: Env) {
   const auth = await requireUser(request, env);
   if (!auth.user) return auth.response!;
@@ -565,8 +751,16 @@ async function purchaseD1ExamPin(request: Request, env: Env) {
   } catch {
     return json({ error: { code: 'EXAM_CATALOGUE_UNAVAILABLE', message: 'The exam PIN catalogue could not be loaded.' } }, 502);
   }
-  if (!product?.available || product.price === null || product.price <= 0) return json({ error: { code: 'PRODUCT_NOT_AVAILABLE', message: 'The selected exam product is unavailable.' } }, 409);
-  const unitMinor = Math.round(product.price * 100);
+  if (!product?.available) return json({ error: { code: 'PRODUCT_NOT_AVAILABLE', message: 'The selected exam product is unavailable.' } }, 409);
+  let priceOverride: { price_minor: number } | null;
+  try {
+    priceOverride = await env.DB.prepare("SELECT price_minor FROM product_price_overrides WHERE service='exampin' AND product_id=?").bind(providerId).first<{ price_minor: number }>();
+  } catch {
+    return json({ error: { code: 'PRODUCT_PRICING_UNAVAILABLE', message: 'Product pricing is temporarily unavailable. Your wallet has not been charged.' } }, 503);
+  }
+  const retailPrice = priceOverride ? Number(priceOverride.price_minor) / 100 : product.price;
+  if (retailPrice === null || retailPrice <= 0) return json({ error: { code: 'PRODUCT_NOT_AVAILABLE', message: 'The selected exam product has no valid price.' } }, 409);
+  const unitMinor = priceOverride ? Number(priceOverride.price_minor) : Math.round(retailPrice * 100);
   const totalMinor = unitMinor * quantity;
   if (!Number.isSafeInteger(totalMinor) || totalMinor <= 0) return json({ error: { code: 'INVALID_PRICE', message: 'The product price is invalid.' } }, 502);
   const existing = await env.DB.prepare('SELECT service, provider_id, provider_name, quantity, unit_price_minor, total_amount_minor, status, pins_json FROM service_transactions WHERE user_id=? AND reference=?').bind(auth.user.uid, reference).first<Record<string, unknown>>();
@@ -590,7 +784,7 @@ async function purchaseD1ExamPin(request: Request, env: Env) {
     supplier = await topupmateRequest(env, '/exampin/', 'POST', { provider: product.id, quantity, ref: reference });
   } catch {
     await env.DB.prepare("UPDATE service_transactions SET status='pending',failure_code='SUPPLIER_OUTCOME_UNCERTAIN',updated_at=? WHERE user_id=? AND reference=? AND status='processing'").bind(Date.now(), auth.user.uid, reference).run();
-    return json({ reference, status: 'pending', product: { id: product.id, provider: product.provider }, quantity, unitPrice: product.price, totalAmount: product.price * quantity, hasDelivery: false, message: 'Your order is awaiting confirmation. Check its status before purchasing again.' }, 202);
+    return json({ reference, status: 'pending', product: { id: product.id, provider: product.provider }, quantity, unitPrice: retailPrice, totalAmount: retailPrice * quantity, hasDelivery: false, message: 'Your order is awaiting confirmation. Check its status before purchasing again.' }, 202);
   }
   const providerStatus = getSupplierTransactionStatus(supplier);
   if (providerStatus === 'failed') {
@@ -606,7 +800,7 @@ async function purchaseD1ExamPin(request: Request, env: Env) {
   const pins = collectPins(supplier);
   const status = providerStatus === 'successful' ? 'successful' : 'pending';
   await env.DB.prepare('UPDATE service_transactions SET status=?,provider_status=?,pins_json=?,updated_at=? WHERE user_id=? AND reference=?').bind(status, providerStatus, JSON.stringify(pins), Date.now(), auth.user.uid, reference).run();
-  return json({ reference, status, product: { id: product.id, provider: product.provider }, quantity, unitPrice: product.price, totalAmount: product.price * quantity, hasDelivery: status === 'successful' && pins.length > 0, message: pins.length ? 'Exam PINs were delivered by TopupMate.' : 'Your exam order is awaiting confirmation.' }, status === 'successful' ? 200 : 202);
+  return json({ reference, status, product: { id: product.id, provider: product.provider }, quantity, unitPrice: retailPrice, totalAmount: retailPrice * quantity, hasDelivery: status === 'successful' && pins.length > 0, message: pins.length ? 'Exam PINs were delivered by TopupMate.' : 'Your exam order is awaiting confirmation.' }, status === 'successful' ? 200 : 202);
 }
 
 async function purchaseD1Airtime(request: Request, env: Env) {
@@ -778,7 +972,12 @@ async function catalog(_request: Request, env: Env, service: 'data' | 'network' 
       : service === 'network' ? normalizeNetworks(result)
         : service === 'electricity' ? normalizeUtilityProviders(result)
           : normalizeExamProducts(result);
-    return json({ [key]: normalized, fetchedAt: new Date().toISOString(), provider: 'topupmate' });
+    const catalogItems = service === 'data'
+      ? await applyDataPriceOverrides(env, normalizeDataPlans(result))
+      : service === 'exampin'
+        ? await applyExamPriceOverrides(env, normalizeExamProducts(result))
+        : normalized;
+    return json({ [key]: catalogItems, fetchedAt: new Date().toISOString(), provider: 'topupmate' });
   } catch {
     return json({ error: { code: 'TOPUPMATE_CATALOGUE_UNAVAILABLE', message: 'The service catalogue is temporarily unavailable.' } }, 502);
   }
@@ -917,11 +1116,16 @@ const worker = {
     if (url.pathname === '/api/cloudflare/reconciliation' && request.method === 'GET') return accountReconciliation(request, env);
     if (url.pathname === '/api/cloudflare/profile' && request.method === 'POST') return syncFirebaseProfile(request, env);
     if (url.pathname === '/api/cloudflare/admin/overview' && request.method === 'GET') return adminOverview(request, env);
+    if (url.pathname === '/api/cloudflare/admin/activity/archive' && request.method === 'POST') return adminArchiveActivity(request, env, false);
+    if (url.pathname === '/api/cloudflare/admin/activity/restore' && request.method === 'POST') return adminArchiveActivity(request, env, true);
+    if (url.pathname === '/api/cloudflare/admin/products' && request.method === 'GET') return adminProducts(request, env);
+    if (url.pathname === '/api/cloudflare/admin/products/prices' && request.method === 'POST') return updateAdminProductPrice(request, env);
     if (url.pathname === '/api/cloudflare/wallet' && request.method === 'GET') return getD1Wallet(request, env);
     const fundingMatch = url.pathname.match(/^\/api\/cloudflare\/wallet\/funding\/([^/]+)$/);
     if (fundingMatch && request.method === 'GET') return getD1Funding(request, env, decodeURIComponent(fundingMatch[1]));
     if (url.pathname === '/api/cloudflare/transactions' && request.method === 'GET') return listD1Transactions(request, env);
     if (url.pathname === '/api/cloudflare/wallet/funding' && request.method === 'POST') return createD1Funding(request, env);
+    if (url.pathname === '/api/cloudflare/services/data/purchase' && request.method === 'POST') return purchaseD1Data(request, env);
     const deliveryMatch = url.pathname.match(/^\/api\/cloudflare\/transactions\/([^/]+)\/delivery$/);
     if (deliveryMatch && request.method === 'GET') return getD1TransactionDelivery(request, env, decodeURIComponent(deliveryMatch[1]));
     if (url.pathname === '/api/cloudflare/services/exam/purchase' && request.method === 'POST') return purchaseD1ExamPin(request, env);
