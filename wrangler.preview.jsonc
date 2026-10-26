@@ -4,6 +4,7 @@
   "main": "cloudflare/worker.ts",
   "compatibility_flags": ["nodejs_compat"],
   "compatibility_date": "2026-10-22",
+  "triggers": { "crons": ["*/5 * * * *"] },
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
@@ -18,6 +19,8 @@
     "CLOUDFLARE_FUNDING_ENABLED": "true",
     "SUPPORT_EMAIL": "support@sameduhub.com",
     "SUPPORT_FROM_EMAIL": "SamEduHub Support <support@sameduhub.com>",
+    "BREVO_SENDER_EMAIL": "support@sameduhub.com",
+    "BREVO_SENDER_NAME": "SamEduHub",
     // Paystack can be tested with test credentials; TopupMate currently
     // targets its live API, so keep supplier purchases disabled until funded.
     "TOPUPMATE_PURCHASES_ENABLED": "false"

@@ -20,3 +20,9 @@ PAYSTACK_FRONTEND_RETURN_URL=""
 # Onboard this sender domain in Cloudflare Email Service before sending.
 SUPPORT_EMAIL="support@sameduhub.com"
 SUPPORT_FROM_EMAIL="SamEduHub Support <support@sameduhub.com>"
+
+# Brevo transactional notifications use the Brevo API over HTTPS from Cloudflare Workers.
+# Keep the actual key only in .dev.vars locally and Cloudflare Worker secrets in deployed environments.
+BREVO_API_KEY=""
+BREVO_SENDER_EMAIL="ogbu8372@gmail.com"
+BREVO_SENDER_NAME="SamEduHub"

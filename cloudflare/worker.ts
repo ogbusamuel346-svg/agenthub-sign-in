@@ -32,6 +32,9 @@ export interface Env {
   CLOUDFLARE_FUNDING_ENABLED?: string;
   SUPPORT_EMAIL?: string;
   SUPPORT_FROM_EMAIL?: string;
+  BREVO_API_KEY?: string;
+  BREVO_SENDER_EMAIL?: string;
+  BREVO_SENDER_NAME?: string;
   SUPPORT_MAILER: {
     send(message: {
       to: string;
@@ -118,6 +121,72 @@ async function requireUser(request: Request, env: Env) {
   const user = await firebaseUser(request, env.FIREBASE_PROJECT_ID);
   if (!user) return { response: json({ error: { code: 'AUTHENTICATION_REQUIRED', message: 'A valid Firebase ID token is required.' } }, 401) };
   return { user };
+}
+
+async function sendBrevoNotification(env: Env, kind: 'wallet_funding' | 'service_purchase', reference: string, userId: string) {
+  const apiKey = env.BREVO_API_KEY?.trim();
+  const senderEmail = env.BREVO_SENDER_EMAIL?.trim();
+  if (!apiKey || !senderEmail) return;
+
+  const now = Date.now();
+  try {
+    await env.DB.prepare("INSERT OR IGNORE INTO email_notifications (event_kind, reference, user_id, status, attempts, created_at, updated_at) VALUES (?, ?, ?, 'pending', 0, ?, ?)").bind(kind, reference, userId, now, now).run();
+    const claimed = await env.DB.prepare("UPDATE email_notifications SET status='sending', attempts=attempts+1, updated_at=? WHERE event_kind=? AND reference=? AND user_id=? AND (status='pending' OR (status='sending' AND updated_at<?))").bind(now, kind, reference, userId, now - 300_000).run();
+    if (((claimed as { meta?: { changes?: number } }).meta?.changes || 0) !== 1) return;
+
+    const record = kind === 'wallet_funding'
+      ? await env.DB.prepare('SELECT u.email, u.display_name, f.amount_minor, f.tx_ref AS reference, f.status FROM wallet_funding_transactions f JOIN users u ON u.id=f.user_id WHERE f.tx_ref=? AND f.user_id=?').bind(reference, userId).first<Record<string, unknown>>()
+      : await env.DB.prepare('SELECT u.email, u.display_name, s.total_amount_minor AS amount_minor, s.reference, s.service, s.provider_name, s.status FROM service_transactions s JOIN users u ON u.id=s.user_id WHERE s.reference=? AND s.user_id=?').bind(reference, userId).first<Record<string, unknown>>();
+    if (!record || record.status !== 'successful' || typeof record.email !== 'string') {
+      await env.DB.prepare("UPDATE email_notifications SET status='pending', updated_at=? WHERE event_kind=? AND reference=? AND status='sending'").bind(Date.now(), kind, reference).run();
+      return;
+    }
+
+    const amount = `NGN ${(Number(record.amount_minor) / 100).toFixed(2)}`;
+    const funding = kind === 'wallet_funding';
+    const subject = funding ? 'Your SamEduHub wallet has been funded' : 'Your SamEduHub purchase is confirmed';
+    const description = funding ? 'Your wallet funding was confirmed and credited.' : `${String(record.service || 'Service')} purchase from ${String(record.provider_name || 'SamEduHub')} was confirmed.`;
+    const name = typeof record.display_name === 'string' && record.display_name.trim() ? record.display_name.trim() : 'Customer';
+    const textContent = `Hello ${name},\n\n${description}\nAmount: ${amount}\nReference: ${reference}\n\nYou can review your transaction in your SamEduHub dashboard.`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8_000);
+    let response: Response;
+    try {
+      response = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: { 'api-key': apiKey, 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          sender: { email: senderEmail, name: env.BREVO_SENDER_NAME?.trim() || 'SamEduHub' },
+          to: [{ email: record.email, name }],
+          subject,
+          textContent,
+          tags: ['sameduhub', funding ? 'wallet-funding' : 'purchase-confirmation'],
+        }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!response.ok) {
+      console.error('Brevo notification request failed with status', response.status);
+      await env.DB.prepare("UPDATE email_notifications SET status='pending', updated_at=? WHERE event_kind=? AND reference=? AND status='sending'").bind(Date.now(), kind, reference).run();
+      return;
+    }
+    await env.DB.prepare("UPDATE email_notifications SET status='sent', sent_at=?, updated_at=? WHERE event_kind=? AND reference=? AND status='sending'").bind(Date.now(), Date.now(), kind, reference).run();
+  } catch (error) {
+    console.error('Brevo notification could not be sent:', error instanceof Error ? error.message : 'unknown error');
+    try { await env.DB.prepare("UPDATE email_notifications SET status='pending', updated_at=? WHERE event_kind=? AND reference=? AND status='sending'").bind(Date.now(), kind, reference).run(); } catch { /* leave pending for a later retry */ }
+  }
+}
+
+async function retryPendingBrevoNotifications(env: Env) {
+  if (!env.BREVO_API_KEY?.trim() || !env.BREVO_SENDER_EMAIL?.trim()) return;
+  try {
+    const pending = await env.DB.prepare("SELECT event_kind, reference, user_id FROM email_notifications WHERE status='pending' OR (status='sending' AND updated_at<?) ORDER BY created_at LIMIT 50").bind(Date.now() - 300_000).all<{ event_kind: 'wallet_funding' | 'service_purchase'; reference: string; user_id: string }>();
+    await Promise.all(pending.results.map(item => sendBrevoNotification(env, item.event_kind, item.reference, item.user_id)));
+  } catch {
+    console.error('Brevo notification retry batch could not be loaded.');
+  }
 }
 
 async function adminOverview(request: Request, env: Env) {
@@ -370,6 +439,7 @@ async function getD1TransactionStatus(request: Request, env: Env) {
     }
     let savedDelivery: unknown = [];
     try { savedDelivery = record.pins_json ? JSON.parse(String(record.pins_json)) : []; } catch { savedDelivery = []; }
+    if (status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
     const transaction = { reference, service: record.service, product: { id: record.provider_id, provider: record.provider_name }, providerId: record.provider_id, providerName: record.provider_name, quantity: record.quantity, unitPrice: Number(record.unit_price_minor) / 100, totalAmount: Number(record.total_amount_minor) / 100, currency: record.currency, status, providerStatus, hasDelivery: status === 'successful' && ((Array.isArray(savedDelivery) && savedDelivery.length > 0) || delivery.length > 0), failureCode: record.failure_code || null, createdAt: record.created_at, updatedAt: now, debitedAt: record.debited_at || null, refundedAt: record.refunded_at || null };
     return json({ reference, status, providerStatus, transaction, checkedAt: new Date().toISOString() });
   } catch {
@@ -529,7 +599,10 @@ async function creditD1Funding(env: Env, txRef: string, expectedTransactionId?: 
   if (!/^[A-Za-z0-9_.=-]{12,160}$/.test(txRef)) throw new Error('invalid transaction reference');
   const record = await env.DB.prepare('SELECT tx_ref, user_id, amount_minor, currency, customer_email, customer_name, status, created_at, updated_at FROM wallet_funding_transactions WHERE tx_ref=?').bind(txRef).first<{ tx_ref: string; user_id: string; amount_minor: number; currency: 'NGN'; customer_email: string; customer_name: string; status: string; created_at: number; updated_at: number }>();
   if (!record) return { status: 'ignored' };
-  if (record.status === 'successful') return { status: 'already_processed' };
+  if (record.status === 'successful') {
+    await sendBrevoNotification(env, 'wallet_funding', record.tx_ref, record.user_id);
+    return { status: 'already_processed' };
+  }
   const transaction = await verifyPaystackTransaction(record.tx_ref, paystackSecret(env));
   if (expectedTransactionId && transaction.id !== expectedTransactionId) throw new Error('provider transaction ID mismatch');
   validateSuccessfulPaystackTransaction({ txRef: record.tx_ref, amountMinor: record.amount_minor, customerEmail: record.customer_email }, transaction);
@@ -542,6 +615,7 @@ async function creditD1Funding(env: Env, txRef: string, expectedTransactionId?: 
   ]);
   const ledgerInserted = credit[0] as { meta?: { changes?: number } };
   if (ledgerInserted.meta?.changes !== 1) return { status: 'already_processed' };
+  await sendBrevoNotification(env, 'wallet_funding', record.tx_ref, record.user_id);
   return { status: 'successful' };
 }
 
@@ -705,6 +779,7 @@ async function purchaseD1Data(request: Request, env: Env) {
   if (existing) {
     if (existing.service !== 'data' || String(existing.provider_id) !== providerId || Number(existing.quantity) !== 1) return json({ error: { code: 'REFERENCE_CONFLICT', message: 'This order reference belongs to another purchase.' } }, 409);
     if (existing.status === 'failed') return json({ error: { code: 'PREVIOUS_ORDER_FAILED', message: 'This order failed and its wallet debit was refunded. Start a new order.' } }, 409);
+    if (existing.status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
     return json({ reference, status: existing.status, plan: { id: planId, network: networkId, name: providerName }, unitPrice: Number(existing.unit_price_minor) / 100, totalAmount: Number(existing.total_amount_minor) / 100, message: 'This order reference has already been recorded.' }, existing.status === 'successful' ? 200 : 202);
   }
   const now = Date.now();
@@ -730,6 +805,7 @@ async function purchaseD1Data(request: Request, env: Env) {
   }
   const status = providerStatus === 'successful' ? 'successful' : 'pending';
   await env.DB.prepare('UPDATE service_transactions SET status=?,provider_status=?,updated_at=? WHERE user_id=? AND reference=?').bind(status, providerStatus, Date.now(), auth.user.uid, reference).run();
+  if (status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
   return json({ reference, status, plan: { id: planId, network: networkId, name: providerName }, unitPrice: retailPrice, totalAmount: retailPrice, message: status === 'successful' ? 'Data delivery was confirmed by the supplier.' : 'Your data purchase is awaiting supplier confirmation.' }, status === 'successful' ? 200 : 202);
 }
 
@@ -768,6 +844,7 @@ async function purchaseD1ExamPin(request: Request, env: Env) {
   if (existing) {
     if (existing.service !== 'exam-pin' || String(existing.provider_id) !== providerId || Number(existing.quantity) !== quantity) return json({ error: { code: 'REFERENCE_CONFLICT', message: 'This order reference belongs to another purchase.' } }, 409);
     if (existing.status === 'failed') return json({ error: { code: 'PREVIOUS_ORDER_FAILED', message: 'This order failed and its wallet debit was refunded. Start a new order.' } }, 409);
+    if (existing.status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
     let delivery: unknown = [];
     try { delivery = existing.pins_json ? JSON.parse(String(existing.pins_json)) : []; } catch { delivery = []; }
     return json({ reference, status: existing.status === 'successful' ? 'successful' : 'pending', product: { id: existing.provider_id, provider: existing.provider_name }, quantity, unitPrice: Number(existing.unit_price_minor) / 100, totalAmount: Number(existing.total_amount_minor) / 100, hasDelivery: existing.status === 'successful' && Array.isArray(delivery) && delivery.length > 0, message: 'This order reference has already been recorded.' }, existing.status === 'successful' ? 200 : 202);
@@ -801,6 +878,7 @@ async function purchaseD1ExamPin(request: Request, env: Env) {
   const pins = collectPins(supplier);
   const status = providerStatus === 'successful' ? 'successful' : 'pending';
   await env.DB.prepare('UPDATE service_transactions SET status=?,provider_status=?,pins_json=?,updated_at=? WHERE user_id=? AND reference=?').bind(status, providerStatus, JSON.stringify(pins), Date.now(), auth.user.uid, reference).run();
+  if (status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
   return json({ reference, status, product: { id: product.id, provider: product.provider }, quantity, unitPrice: retailPrice, totalAmount: retailPrice * quantity, hasDelivery: status === 'successful' && pins.length > 0, message: pins.length ? 'Exam PINs were delivered by TopupMate.' : 'Your exam order is awaiting confirmation.' }, status === 'successful' ? 200 : 202);
 }
 
@@ -831,6 +909,7 @@ async function purchaseD1Airtime(request: Request, env: Env) {
   const existing = await env.DB.prepare('SELECT service, provider_id, provider_name, quantity, unit_price_minor, total_amount_minor, status, pins_json FROM service_transactions WHERE user_id=? AND reference=?').bind(auth.user.uid, reference).first<Record<string, unknown>>();
   if (existing) {
     if (existing.service !== 'airtime' || String(existing.provider_id) !== networkId || Number(existing.total_amount_minor) !== amountMinor) return json({ error: { code: 'REFERENCE_CONFLICT', message: 'This order reference belongs to another purchase.' } }, 409);
+    if (existing.status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
     return json({ reference, status: existing.status === 'successful' ? 'successful' : existing.status, network: { id: networkId, name: String(existing.provider_name) }, amount: amountMinor / 100, message: 'This order reference has already been recorded.' }, existing.status === 'successful' ? 200 : 202);
   }
 
@@ -858,6 +937,7 @@ async function purchaseD1Airtime(request: Request, env: Env) {
   }
   const status = providerStatus === 'successful' ? 'successful' : 'pending';
   await env.DB.prepare('UPDATE service_transactions SET status=?,provider_status=?,updated_at=? WHERE user_id=? AND reference=?').bind(status, providerStatus, Date.now(), auth.user.uid, reference).run();
+  if (status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
   return json({ reference, status, network: { id: networkId, name: network.name }, amount, message: status === 'successful' ? 'Airtime delivery was confirmed by the supplier.' : 'Your airtime request is awaiting supplier confirmation.' }, status === 'successful' ? 200 : 202);
 }
 
@@ -887,6 +967,7 @@ async function purchaseD1Electricity(request: Request, env: Env) {
   if (existing) {
     if (existing.service !== 'electricity' || String(existing.provider_id) !== providerId || Number(existing.total_amount_minor) !== amountMinor) return json({ error: { code: 'REFERENCE_CONFLICT', message: 'This order reference belongs to another purchase.' } }, 409);
     if (existing.status === 'failed') return json({ error: { code: 'PREVIOUS_ORDER_FAILED', message: 'This order failed and its wallet debit was refunded. Start a new order.' } }, 409);
+    if (existing.status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
     let delivery: unknown = [];
     try { delivery = existing.pins_json ? JSON.parse(String(existing.pins_json)) : []; } catch { delivery = []; }
     return json({ reference, status: existing.status, provider: { id: providerId, name: String(existing.provider_name) }, amount, hasDelivery: existing.status === 'successful' && Array.isArray(delivery) && delivery.length > 0, message: 'This order reference has already been recorded. Check its status before submitting again.' }, existing.status === 'successful' ? 200 : 202);
@@ -921,6 +1002,7 @@ async function purchaseD1Electricity(request: Request, env: Env) {
   const status = providerStatus === 'successful' ? 'successful' : 'pending';
   const delivery = collectPins(supplier);
   await env.DB.prepare('UPDATE service_transactions SET status=?,provider_status=?,pins_json=?,updated_at=? WHERE user_id=? AND reference=?').bind(status, providerStatus, JSON.stringify(delivery), Date.now(), auth.user.uid, reference).run();
+  if (status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
   return json({ reference, status, provider: { id: providerId, name: provider.name }, amount, hasDelivery: status === 'successful' && delivery.length > 0, message: status === 'successful' ? delivery.length ? 'The electricity payment was confirmed and the token is ready to download.' : 'The electricity payment was confirmed. The token is not available from the supplier response yet.' : 'Your electricity order is awaiting supplier confirmation.' }, status === 'successful' ? 200 : 202);
 }
 
@@ -1085,6 +1167,9 @@ async function cloudflareHealth(env: Env) {
 }
 
 const worker = {
+  async scheduled(_controller: { scheduledTime: number; cron: string }, env: Env) {
+    await retryPendingBrevoNotifications(env);
+  },
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const walletRoute = url.pathname.startsWith('/api/cloudflare/wallet')
