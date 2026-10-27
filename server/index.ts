@@ -49,7 +49,8 @@ app.disable('x-powered-by');
 app.use(express.json({
   limit: '64kb',
   verify: (req, _res, buffer) => {
-    if (req.originalUrl === '/api/paystack/webhook') (req as Request & { rawBody?: Buffer }).rawBody = Buffer.from(buffer);
+    const expressRequest = req as Request & { rawBody?: Buffer };
+    if (expressRequest.originalUrl === '/api/paystack/webhook') expressRequest.rawBody = Buffer.from(buffer);
   },
 }));
 

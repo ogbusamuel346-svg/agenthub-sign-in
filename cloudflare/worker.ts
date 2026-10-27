@@ -28,6 +28,8 @@ export interface Env {
   TOPUPMATE_ADMIN_VIEW_TOKEN?: string;
   FIREBASE_PROJECT_ID?: string;
   PAYSTACK_FRONTEND_RETURN_URL?: string;
+  PAYSTACK_VIRTUAL_ACCOUNTS_ENABLED?: string;
+  PAYSTACK_VIRTUAL_ACCOUNT_BANK?: string;
   CLOUDFLARE_WALLET_CUTOVER?: string;
   CLOUDFLARE_FUNDING_ENABLED?: string;
   SUPPORT_EMAIL?: string;
@@ -533,6 +535,277 @@ function paystackReady(env: Env, expectedMode?: 'test' | 'live') {
   }
 }
 
+type PaystackApiPayload<T = unknown> = { status?: boolean; message?: string; data?: T } | null;
+type PaystackApiResult<T = unknown> = { httpStatus: number; payload: PaystackApiPayload<T> };
+
+type PaystackCustomer = {
+  id?: number;
+  customer_code?: string;
+  email?: string;
+  first_name?: string | null;
+  last_name?: string | null;
+  phone?: string | null;
+  dedicated_account?: PaystackDedicatedAccount | null;
+};
+
+type PaystackDedicatedAccount = {
+  id?: number;
+  account_name?: string;
+  account_number?: string;
+  currency?: string;
+  active?: boolean | number;
+  assigned?: boolean | number;
+  bank?: { name?: string; slug?: string } | null;
+};
+
+type VirtualAccountRow = {
+  user_id: string;
+  customer_id: number | null;
+  customer_code: string | null;
+  account_id: number | null;
+  account_number: string | null;
+  account_name: string | null;
+  bank_name: string | null;
+  bank_slug: string | null;
+  currency: string;
+  status: 'creating' | 'pending' | 'assigned' | 'failed';
+  failure_code: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+function virtualAccountsReady(env: Env) {
+  return env.PAYSTACK_VIRTUAL_ACCOUNTS_ENABLED === 'true'
+    && env.CLOUDFLARE_FUNDING_ENABLED === 'true'
+    && paystackReady(env);
+}
+
+async function paystackApi<T>(env: Env, path: string, method: 'GET' | 'POST' | 'PUT', body?: unknown): Promise<PaystackApiResult<T>> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12_000);
+  try {
+    const response = await fetch(`https://api.paystack.co${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${paystackSecret(env)}`, Accept: 'application/json', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      signal: controller.signal,
+    });
+    const payload = await response.json().catch(() => null) as PaystackApiPayload<T>;
+    return { httpStatus: response.status, payload };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function normalizePaystackPhone(value: unknown) {
+  if (typeof value !== 'string') return null;
+  const compact = value.trim().replace(/[\s()-]/g, '');
+  if (/^0\d{10}$/.test(compact)) return `+234${compact.slice(1)}`;
+  if (/^234\d{10}$/.test(compact)) return `+${compact}`;
+  if (/^\+234\d{10}$/.test(compact)) return compact;
+  return null;
+}
+
+function splitPaystackName(value: unknown) {
+  if (typeof value !== 'string') return null;
+  const parts = value.trim().split(/\s+/).filter(Boolean);
+  if (parts.length < 2) return null;
+  return { first_name: parts[0], last_name: parts.slice(1).join(' ') };
+}
+
+function normalizeDedicatedAccount(value: unknown): PaystackDedicatedAccount | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const candidate = value as PaystackDedicatedAccount;
+  if (typeof candidate.account_number !== 'string' || !/^\d{10}$/.test(candidate.account_number)) return null;
+  if (candidate.currency && candidate.currency !== 'NGN') return null;
+  const assigned = candidate.assigned === true || candidate.assigned === 1;
+  const active = candidate.active === undefined || candidate.active === true || candidate.active === 1;
+  if (!assigned || !active) return null;
+  return candidate;
+}
+
+function publicVirtualAccount(row: VirtualAccountRow | null) {
+  if (!row || row.status !== 'assigned' || !row.account_number) return { account: null, status: row?.status || 'not_created' };
+  return {
+    status: 'assigned',
+    account: {
+      accountNumber: row.account_number,
+      accountName: row.account_name,
+      bankName: row.bank_name,
+      currency: row.currency,
+    },
+  };
+}
+
+async function storeDedicatedAccount(env: Env, userId: string, customer: PaystackCustomer, account: PaystackDedicatedAccount | null, status: 'pending' | 'assigned') {
+  await env.DB.prepare(`UPDATE paystack_virtual_accounts
+    SET customer_id=COALESCE(?, customer_id), customer_code=COALESCE(?, customer_code),
+        account_id=COALESCE(?, account_id), account_number=COALESCE(?, account_number),
+        account_name=COALESCE(?, account_name), bank_name=COALESCE(?, bank_name),
+        bank_slug=COALESCE(?, bank_slug), currency=COALESCE(?, currency),
+        status=?, failure_code=NULL, updated_at=? WHERE user_id=?`)
+    .bind(
+      typeof customer.id === 'number' ? customer.id : null,
+      typeof customer.customer_code === 'string' ? customer.customer_code : null,
+      typeof account?.id === 'number' ? account.id : null,
+      account?.account_number || null,
+      account?.account_name || null,
+      account?.bank?.name || null,
+      account?.bank?.slug || null,
+      account?.currency || null,
+      status,
+      Date.now(),
+      userId,
+    ).run();
+}
+
+async function getStoredVirtualAccount(env: Env, userId: string) {
+  return env.DB.prepare('SELECT user_id, customer_id, customer_code, account_id, account_number, account_name, bank_name, bank_slug, currency, status, failure_code, created_at, updated_at FROM paystack_virtual_accounts WHERE user_id=?').bind(userId).first<VirtualAccountRow>();
+}
+
+async function refreshStoredVirtualAccount(env: Env, row: VirtualAccountRow) {
+  if (!row.customer_code || row.status === 'assigned') return row;
+  const response = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(row.customer_code)}`, 'GET');
+  const customer = response.payload?.status === true && response.payload.data ? response.payload.data : null;
+  const account = normalizeDedicatedAccount(customer?.dedicated_account);
+  if (customer && account) {
+    await storeDedicatedAccount(env, row.user_id, customer, account, 'assigned');
+    return getStoredVirtualAccount(env, row.user_id);
+  }
+  return row;
+}
+
+async function getD1VirtualAccount(request: Request, env: Env) {
+  const auth = await requireUser(request, env);
+  if (!auth.user) return auth.response!;
+  if (!virtualAccountsReady(env)) return json({ error: { code: 'PAYSTACK_VIRTUAL_ACCOUNTS_DISABLED', message: 'Dedicated account funding is not enabled in this environment.' } }, 503);
+  try {
+    const stored = await getStoredVirtualAccount(env, auth.user.uid);
+    const refreshed = stored ? await refreshStoredVirtualAccount(env, stored).catch(() => stored) : null;
+    return json(publicVirtualAccount(refreshed));
+  } catch {
+    return json({ error: { code: 'VIRTUAL_ACCOUNT_UNAVAILABLE', message: 'Your dedicated account could not be loaded right now.' } }, 503);
+  }
+}
+
+async function createD1VirtualAccount(request: Request, env: Env) {
+  const auth = await requireUser(request, env);
+  if (!auth.user) return auth.response!;
+  if (!virtualAccountsReady(env)) return json({ error: { code: 'PAYSTACK_VIRTUAL_ACCOUNTS_DISABLED', message: 'Dedicated account funding is not enabled in this environment.' } }, 503);
+
+  const body = await request.json().catch(() => null) as { phone?: unknown } | null;
+  const user = await env.DB.prepare('SELECT display_name, phone FROM users WHERE id=?').bind(auth.user.uid).first<{ display_name: string | null; phone: string | null }>();
+  const phone = normalizePaystackPhone(body?.phone) || normalizePaystackPhone(user?.phone);
+  const name = splitPaystackName(auth.user.name || user?.display_name);
+  if (!phone) return json({ error: { code: 'PHONE_REQUIRED', message: 'Enter a valid Nigerian phone number before creating your dedicated account.' } }, 400);
+  if (!name) return json({ error: { code: 'FULL_NAME_REQUIRED', message: 'Update your profile with your first and last name before creating your dedicated account.' } }, 400);
+
+  const now = Date.now();
+  const email = auth.user.email?.trim().toLowerCase();
+  if (!email) return json({ error: { code: 'EMAIL_REQUIRED', message: 'A verified account email is required before creating a dedicated account.' } }, 400);
+  await env.DB.prepare("INSERT INTO users (id, email, display_name, phone, email_verified, identity_provider, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'firebase', ?, ?) ON CONFLICT(id) DO UPDATE SET email=excluded.email, display_name=COALESCE(excluded.display_name, users.display_name), phone=excluded.phone, email_verified=excluded.email_verified, updated_at=excluded.updated_at")
+    .bind(auth.user.uid, email, auth.user.name || user?.display_name || null, phone, auth.user.emailVerified ? 1 : 0, now, now).run();
+  await env.DB.prepare('INSERT INTO wallets (user_id, balance_minor, updated_at) VALUES (?, 0, ?) ON CONFLICT(user_id) DO NOTHING').bind(auth.user.uid, now).run();
+
+  let stored = await getStoredVirtualAccount(env, auth.user.uid);
+  if (stored?.status === 'assigned' && stored.account_number) return json(publicVirtualAccount(stored));
+  if (stored?.status === 'creating' && now - stored.updated_at < 120_000) return json({ ...publicVirtualAccount(stored), message: 'Your dedicated account request is already being processed.' }, 202);
+
+  if (stored?.customer_code) {
+    try {
+      const refreshed = await refreshStoredVirtualAccount(env, stored);
+      if (refreshed?.status === 'assigned' && refreshed.account_number) return json(publicVirtualAccount(refreshed));
+    } catch { /* Continue with the existing customer record below. */ }
+  }
+
+  const claimed = await env.DB.prepare("INSERT INTO paystack_virtual_accounts (user_id, status, currency, created_at, updated_at) VALUES (?, 'creating', 'NGN', ?, ?) ON CONFLICT(user_id) DO UPDATE SET status='creating', failure_code=NULL, updated_at=? WHERE paystack_virtual_accounts.status <> 'assigned' AND (paystack_virtual_accounts.status='failed' OR paystack_virtual_accounts.updated_at<?)")
+    .bind(auth.user.uid, now, now, now, now - 120_000).run() as { meta?: { changes?: number } };
+  if (Number(claimed.meta?.changes || 0) !== 1) {
+    stored = await getStoredVirtualAccount(env, auth.user.uid);
+    return json({ ...publicVirtualAccount(stored), message: 'Your dedicated account request is already being processed.' }, 202);
+  }
+
+  try {
+    let customerResponse = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(email)}`, 'GET');
+    let customer = customerResponse.payload?.status === true && customerResponse.payload.data ? customerResponse.payload.data : null;
+    if (!customer && customerResponse.httpStatus !== 404) throw new Error('PAYSTACK_CUSTOMER_LOOKUP_FAILED');
+    if (!customer) {
+      customerResponse = await paystackApi<PaystackCustomer>(env, '/customer', 'POST', { email, ...name, phone });
+      if (customerResponse.payload?.status !== true || !customerResponse.payload.data) throw new Error('PAYSTACK_CUSTOMER_CREATE_FAILED');
+      customer = customerResponse.payload.data;
+    } else if (customer.customer_code) {
+      const update = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(customer.customer_code)}`, 'PUT', { ...name, phone });
+      if (update.payload?.status === true && update.payload.data) customer = update.payload.data;
+    }
+    if (!customer.customer_code && typeof customer.id !== 'number') throw new Error('PAYSTACK_CUSTOMER_INCOMPLETE');
+    await storeDedicatedAccount(env, auth.user.uid, customer, null, 'pending');
+
+    const preferredBank = env.PAYSTACK_VIRTUAL_ACCOUNT_BANK?.trim();
+    const accountResponse = await paystackApi<PaystackDedicatedAccount>(env, '/dedicated_account', 'POST', {
+      customer: customer.customer_code || customer.id,
+      ...(preferredBank ? { preferred_bank: preferredBank } : {}),
+    });
+    if (accountResponse.payload?.status !== true) throw new Error('PAYSTACK_DEDICATED_ACCOUNT_CREATE_FAILED');
+    const account = normalizeDedicatedAccount(accountResponse.payload.data);
+    if (account) {
+      await storeDedicatedAccount(env, auth.user.uid, customer, account, 'assigned');
+      return json(publicVirtualAccount(await getStoredVirtualAccount(env, auth.user.uid)), 201);
+    }
+
+    const refreshedResponse = customer.customer_code
+      ? await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(customer.customer_code)}`, 'GET')
+      : null;
+    const refreshedCustomer = refreshedResponse?.payload?.status === true && refreshedResponse.payload.data ? refreshedResponse.payload.data : customer;
+    const refreshedAccount = normalizeDedicatedAccount(refreshedCustomer.dedicated_account);
+    if (refreshedAccount) {
+      await storeDedicatedAccount(env, auth.user.uid, refreshedCustomer, refreshedAccount, 'assigned');
+      return json(publicVirtualAccount(await getStoredVirtualAccount(env, auth.user.uid)), 201);
+    }
+    await env.DB.prepare("UPDATE paystack_virtual_accounts SET status='pending', updated_at=? WHERE user_id=?").bind(Date.now(), auth.user.uid).run();
+    return json({ account: null, status: 'pending', message: 'Paystack is assigning your dedicated account. Refresh this page shortly.' }, 202);
+  } catch (error) {
+    console.error('[paystack] virtual account creation failed', { code: error instanceof Error ? error.message : 'UNKNOWN' });
+    await env.DB.prepare("UPDATE paystack_virtual_accounts SET status='failed', failure_code='PAYSTACK_REQUEST_FAILED', updated_at=? WHERE user_id=? AND status<>'assigned'").bind(Date.now(), auth.user.uid).run();
+    return json({ error: { code: 'VIRTUAL_ACCOUNT_CREATION_FAILED', message: 'Paystack could not create your dedicated account. No wallet balance was changed.' } }, 502);
+  }
+}
+
+async function creditD1VirtualAccountDeposit(env: Env, payload: {
+  data?: {
+    id?: unknown;
+    amount?: unknown;
+    currency?: unknown;
+    status?: unknown;
+    authorization?: { channel?: unknown; receiver_bank_account_number?: unknown };
+    customer?: { customer_code?: unknown; email?: unknown };
+  };
+}) {
+  const data = payload.data;
+  const transactionId = data?.id === undefined ? '' : String(data.id);
+  const amountMinor = Number(data?.amount);
+  const accountNumber = typeof data?.authorization?.receiver_bank_account_number === 'string' ? data.authorization.receiver_bank_account_number : '';
+  const customerCode = typeof data?.customer?.customer_code === 'string' ? data.customer.customer_code : '';
+  if (!/^\d+$/.test(transactionId) || !Number.isSafeInteger(amountMinor) || amountMinor <= 0 || data?.currency !== 'NGN' || data?.status !== 'success') return { status: 'ignored' };
+  if (!accountNumber && !customerCode) return { status: 'ignored' };
+
+  const record = accountNumber
+    ? await env.DB.prepare('SELECT v.user_id, v.account_number, v.customer_code, u.email, u.display_name FROM paystack_virtual_accounts v JOIN users u ON u.id=v.user_id WHERE v.account_number=? AND v.status=\'assigned\'').bind(accountNumber).first<{ user_id: string; account_number: string; customer_code: string | null; email: string; display_name: string | null }>()
+    : await env.DB.prepare('SELECT v.user_id, v.account_number, v.customer_code, u.email, u.display_name FROM paystack_virtual_accounts v JOIN users u ON u.id=v.user_id WHERE v.customer_code=? AND v.status=\'assigned\'').bind(customerCode).first<{ user_id: string; account_number: string | null; customer_code: string | null; email: string; display_name: string | null }>();
+  if (!record) return { status: 'unmatched' };
+
+  const txRef = `VA-${transactionId}`;
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB.prepare("INSERT OR IGNORE INTO wallet_funding_transactions (tx_ref, user_id, amount_minor, currency, customer_email, customer_name, status, provider_transaction_id, created_at, updated_at) VALUES (?, ?, ?, 'NGN', ?, ?, 'processing', ?, ?, ?)").bind(txRef, record.user_id, amountMinor, record.email, record.display_name || 'Customer', transactionId, now, now),
+    env.DB.prepare("INSERT OR IGNORE INTO wallet_ledger (id, user_id, tx_ref, amount_minor, currency, provider_transaction_id, created_at) VALUES (?, ?, ?, ?, 'NGN', ?, ?)").bind(`wallet:${txRef}`, record.user_id, txRef, amountMinor, transactionId, now),
+    env.DB.prepare("UPDATE wallets SET balance_minor=balance_minor+?, updated_at=? WHERE user_id=? AND EXISTS (SELECT 1 FROM wallet_ledger WHERE id=? AND tx_ref=? AND provider_transaction_id=?) AND EXISTS (SELECT 1 FROM wallet_funding_transactions WHERE tx_ref=? AND credited_at IS NULL)").bind(amountMinor, now, record.user_id, `wallet:${txRef}`, txRef, transactionId, txRef),
+    env.DB.prepare("UPDATE wallet_funding_transactions SET status='successful', provider_transaction_id=?, credited_at=COALESCE(credited_at, ?), updated_at=? WHERE tx_ref=?").bind(transactionId, now, now, txRef),
+  ]);
+  await env.DB.prepare('INSERT OR IGNORE INTO paystack_virtual_account_events (event_key, event, transaction_id, account_number, customer_code, amount_minor, received_at) VALUES (?, \'charge.success\', ?, ?, ?, ?, ?)').bind(`charge.success:${transactionId}:success`, transactionId, accountNumber || record.account_number, customerCode || record.customer_code, amountMinor, now).run();
+  await sendBrevoNotification(env, 'wallet_funding', txRef, record.user_id);
+  return { status: 'successful', txRef };
+}
+
 function topupmateUrlMatchesMode(env: Env, mode: 'sandbox' | 'live') {
   if (!env.TOPUPMATE_API_BASE_URL) return false;
   try {
@@ -623,9 +896,29 @@ async function paystackWebhook(request: Request, env: Env) {
   if (env.CLOUDFLARE_FUNDING_ENABLED !== 'true') return new Response(null, { status: 404 });
   const rawBody = new Uint8Array(await request.arrayBuffer());
   if (!isValidPaystackWebhookSignature(request.headers.get('x-paystack-signature') || undefined, env.PAYSTACK_SECRET_KEY, rawBody)) return new Response(null, { status: 401 });
-  let payload: { event?: unknown; data?: { id?: unknown; reference?: unknown; status?: unknown } } | null = null;
+  let payload: {
+    event?: unknown;
+    data?: {
+      id?: unknown;
+      reference?: unknown;
+      amount?: unknown;
+      currency?: unknown;
+      status?: unknown;
+      authorization?: { channel?: unknown; receiver_bank_account_number?: unknown };
+      customer?: { customer_code?: unknown; email?: unknown };
+    };
+  } | null = null;
   try { payload = JSON.parse(new TextDecoder().decode(rawBody)); } catch { return json({ ok: false }, 400); }
   const event = typeof payload?.event === 'string' ? payload.event : '';
+  if (event === 'charge.success' && payload?.data?.authorization?.channel === 'dedicated_nuban' && env.PAYSTACK_VIRTUAL_ACCOUNTS_ENABLED === 'true') {
+    try {
+      const result = await creditD1VirtualAccountDeposit(env, payload);
+      return json({ ok: true, ...result });
+    } catch (error) {
+      console.error('[paystack] dedicated account webhook processing failed', { code: error instanceof Error ? error.message : 'UNKNOWN' });
+      return json({ ok: false }, 500);
+    }
+  }
   const transactionId = payload?.data?.id === undefined ? '' : String(payload.data.id);
   const txRef = typeof payload?.data?.reference === 'string' ? payload.data.reference : '';
   const status = typeof payload?.data?.status === 'string' ? payload.data.status : '';
@@ -1181,6 +1474,7 @@ const worker = {
     const fundingEnabled = env.CLOUDFLARE_FUNDING_ENABLED === 'true';
     const fundingPath = url.pathname === '/api/cloudflare/wallet/funding'
       || /^\/api\/cloudflare\/wallet\/funding\/[^/]+$/.test(url.pathname)
+      || url.pathname === '/api/cloudflare/paystack/virtual-account'
       || url.pathname === '/api/cloudflare/paystack/callback'
       || url.pathname === '/api/cloudflare/paystack/webhook';
     const previewBalanceRead = url.pathname === '/api/cloudflare/wallet' && request.method === 'GET' && fundingEnabled;
@@ -1211,6 +1505,8 @@ const worker = {
     if (fundingMatch && request.method === 'GET') return getD1Funding(request, env, decodeURIComponent(fundingMatch[1]));
     if (url.pathname === '/api/cloudflare/transactions' && request.method === 'GET') return listD1Transactions(request, env);
     if (url.pathname === '/api/cloudflare/wallet/funding' && request.method === 'POST') return createD1Funding(request, env);
+    if (url.pathname === '/api/cloudflare/paystack/virtual-account' && request.method === 'GET') return getD1VirtualAccount(request, env);
+    if (url.pathname === '/api/cloudflare/paystack/virtual-account' && request.method === 'POST') return createD1VirtualAccount(request, env);
     if (url.pathname === '/api/cloudflare/services/data/purchase' && request.method === 'POST') return purchaseD1Data(request, env);
     const deliveryMatch = url.pathname.match(/^\/api\/cloudflare\/transactions\/([^/]+)\/delivery$/);
     if (deliveryMatch && request.method === 'GET') return getD1TransactionDelivery(request, env, decodeURIComponent(deliveryMatch[1]));

@@ -15,6 +15,10 @@ CLOUDFLARE_WALLET_CUTOVER="false"
 
 # Optional return-to-app URL after Paystack payment.
 PAYSTACK_FRONTEND_RETURN_URL=""
+# Keep false until Paystack DVA access and webhook crediting are verified.
+PAYSTACK_VIRTUAL_ACCOUNTS_ENABLED="false"
+# Paystack test mode requires `test-bank`; leave empty in live mode unless a supported bank is selected.
+PAYSTACK_VIRTUAL_ACCOUNT_BANK="test-bank"
 
 # Cloudflare Email Service uses the SUPPORT_MAILER Worker binding.
 # Onboard this sender domain in Cloudflare Email Service before sending.

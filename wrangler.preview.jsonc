@@ -17,6 +17,8 @@
     "TOPUPMATE_MODE": "live",
     "CLOUDFLARE_WALLET_CUTOVER": "true",
     "CLOUDFLARE_FUNDING_ENABLED": "true",
+    "PAYSTACK_VIRTUAL_ACCOUNTS_ENABLED": "false",
+    "PAYSTACK_VIRTUAL_ACCOUNT_BANK": "test-bank",
     "SUPPORT_EMAIL": "support@sameduhub.com",
     "SUPPORT_FROM_EMAIL": "SamEduHub Support <support@sameduhub.com>",
     "BREVO_SENDER_EMAIL": "support@sameduhub.com",
