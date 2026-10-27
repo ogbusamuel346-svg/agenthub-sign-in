@@ -696,9 +696,9 @@ async function createD1VirtualAccount(request: Request, env: Env) {
   const body = await request.json().catch(() => null) as { phone?: unknown } | null;
   const user = await env.DB.prepare('SELECT display_name, phone FROM users WHERE id=?').bind(auth.user.uid).first<{ display_name: string | null; phone: string | null }>();
   const phone = normalizePaystackPhone(body?.phone) || normalizePaystackPhone(user?.phone);
-  const name = splitPaystackName(auth.user.name || user?.display_name);
+  const name = splitPaystackName(user?.display_name || auth.user.name);
   if (!phone) return json({ error: { code: 'PHONE_REQUIRED', message: 'Enter a valid Nigerian phone number before creating your dedicated account.' } }, 400);
-  if (!name) return json({ error: { code: 'FULL_NAME_REQUIRED', message: 'Update your profile with your first and last name before creating your dedicated account.' } }, 400);
+  if (!name) return json({ error: { code: 'FULL_NAME_REQUIRED', message: 'Enter your first and last name in Profile, separated by a space, then save your profile before creating your dedicated account.' } }, 400);
 
   const now = Date.now();
   const email = auth.user.email?.trim().toLowerCase();

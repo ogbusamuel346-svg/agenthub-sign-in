@@ -591,6 +591,10 @@ function ProfilePage({ currentUser, onNavigate, onProfileUpdated }: DashboardPag
     setSaving(true);
     try {
       await updateProfile(auth.currentUser, { displayName: name.trim() });
+      await auth.currentUser.getIdToken(true);
+      if (import.meta.env.VITE_CLOUDFLARE_API === 'true') {
+        await apiRequest('/api/cloudflare/profile', { method: 'POST', body: JSON.stringify({}) }, { authenticated: true });
+      }
       onProfileUpdated(name.trim());
       setStatus({ type: 'success', title: 'Profile updated', message: 'Your display name has been saved.' });
     } catch (error) {
