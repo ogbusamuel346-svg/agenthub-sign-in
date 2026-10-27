@@ -538,6 +538,13 @@ function paystackReady(env: Env, expectedMode?: 'test' | 'live') {
 type PaystackApiPayload<T = unknown> = { status?: boolean; message?: string; data?: T } | null;
 type PaystackApiResult<T = unknown> = { httpStatus: number; payload: PaystackApiPayload<T> };
 
+class PaystackProviderError extends Error {
+  constructor(readonly operation: string, readonly httpStatus: number, readonly providerMessage: string) {
+    super(`${operation} failed (${httpStatus})`);
+    this.name = 'PaystackProviderError';
+  }
+}
+
 type PaystackCustomer = {
   id?: number;
   customer_code?: string;
@@ -595,6 +602,34 @@ async function paystackApi<T>(env: Env, path: string, method: 'GET' | 'POST' | '
   } finally {
     clearTimeout(timer);
   }
+}
+
+function requirePaystackPayload<T>(result: PaystackApiResult<T>, operation: string) {
+  if (result.payload?.status !== true) {
+    throw new PaystackProviderError(operation, result.httpStatus, result.payload?.message || 'Paystack rejected the request.');
+  }
+  return result.payload.data;
+}
+
+function paystackFailureCode(error: unknown) {
+  if (!(error instanceof PaystackProviderError)) return 'PAYSTACK_REQUEST_FAILED';
+  const message = error.providerMessage.toLowerCase();
+  if (error.httpStatus === 401 || error.httpStatus === 403) return 'PAYSTACK_CREDENTIALS_REJECTED';
+  if (error.httpStatus === 429) return 'PAYSTACK_RATE_LIMITED';
+  if (message.includes('bvn') || message.includes('identif') || message.includes('bank account')) return 'PAYSTACK_CUSTOMER_VALIDATION_REQUIRED';
+  if (message.includes('dedicated') && (message.includes('activat') || message.includes('available') || message.includes('enable'))) return 'PAYSTACK_DVA_NOT_ACTIVE';
+  return 'PAYSTACK_REQUEST_FAILED';
+}
+
+function paystackFailureMessage(error: unknown) {
+  if (!(error instanceof PaystackProviderError)) return 'Paystack could not create your dedicated account. No wallet balance was changed.';
+  const code = paystackFailureCode(error);
+  if (code === 'PAYSTACK_CREDENTIALS_REJECTED') return 'The Paystack server credential was rejected. Confirm the live secret is configured on this Worker.';
+  if (code === 'PAYSTACK_RATE_LIMITED') return 'Paystack is temporarily rate-limiting account requests. Wait a moment and try again.';
+  if (code === 'PAYSTACK_CUSTOMER_VALIDATION_REQUIRED') return 'Paystack requires customer identity validation before issuing this dedicated account. Complete the requested bank-account verification details and try again.';
+  if (code === 'PAYSTACK_DVA_NOT_ACTIVE') return 'Dedicated Virtual Accounts are not active for this Paystack live integration. Activate the feature in Paystack before trying again.';
+  if (error.httpStatus >= 500) return 'Paystack is temporarily unavailable. No wallet balance was changed; try again later.';
+  return 'Paystack rejected the dedicated-account request. Confirm the customer profile and Paystack DVA settings, then try again.';
 }
 
 function normalizePaystackPhone(value: unknown) {
@@ -664,13 +699,30 @@ async function getStoredVirtualAccount(env: Env, userId: string) {
 }
 
 async function refreshStoredVirtualAccount(env: Env, row: VirtualAccountRow) {
-  if (!row.customer_code || row.status === 'assigned') return row;
-  const response = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(row.customer_code)}`, 'GET');
-  const customer = response.payload?.status === true && response.payload.data ? response.payload.data : null;
-  const account = normalizeDedicatedAccount(customer?.dedicated_account);
+  if (row.status === 'assigned') return row;
+  let customer: PaystackCustomer | null = null;
+  if (row.customer_code) {
+    const response = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(row.customer_code)}`, 'GET');
+    customer = response.payload?.status === true && response.payload.data ? response.payload.data : null;
+  } else {
+    const user = await env.DB.prepare('SELECT email FROM users WHERE id=?').bind(row.user_id).first<{ email: string }>();
+    if (user?.email) {
+      const response = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(user.email)}`, 'GET');
+      customer = response.payload?.status === true && response.payload.data ? response.payload.data : null;
+    }
+  }
+  let account = normalizeDedicatedAccount(customer?.dedicated_account);
+  if (!account && typeof customer?.id === 'number') {
+    const accountsResponse = await paystackApi<PaystackDedicatedAccount[]>(env, `/dedicated_account?customer=${encodeURIComponent(String(customer.id))}`, 'GET');
+    const accounts = requirePaystackPayload(accountsResponse, 'list dedicated accounts');
+    account = Array.isArray(accounts) ? accounts.map(normalizeDedicatedAccount).find((candidate): candidate is PaystackDedicatedAccount => Boolean(candidate)) || null : null;
+  }
   if (customer && account) {
     await storeDedicatedAccount(env, row.user_id, customer, account, 'assigned');
     return getStoredVirtualAccount(env, row.user_id);
+  }
+  if (customer && !row.customer_code) {
+    await storeDedicatedAccount(env, row.user_id, customer, null, 'pending');
   }
   return row;
 }
@@ -693,10 +745,17 @@ async function createD1VirtualAccount(request: Request, env: Env) {
   if (!auth.user) return auth.response!;
   if (!virtualAccountsReady(env)) return json({ error: { code: 'PAYSTACK_VIRTUAL_ACCOUNTS_DISABLED', message: 'Dedicated account funding is not enabled in this environment.' } }, 503);
 
-  const body = await request.json().catch(() => null) as { phone?: unknown } | null;
+  const body = await request.json().catch(() => null) as { phone?: unknown; bankAccountNumber?: unknown; bankCode?: unknown; bvn?: unknown } | null;
   const user = await env.DB.prepare('SELECT display_name, phone FROM users WHERE id=?').bind(auth.user.uid).first<{ display_name: string | null; phone: string | null }>();
   const phone = normalizePaystackPhone(body?.phone) || normalizePaystackPhone(user?.phone);
   const name = splitPaystackName(user?.display_name || auth.user.name);
+  const bankAccountNumber = typeof body?.bankAccountNumber === 'string' ? body.bankAccountNumber.trim() : '';
+  const bankCode = typeof body?.bankCode === 'string' ? body.bankCode.trim() : '';
+  const bvn = typeof body?.bvn === 'string' ? body.bvn.trim() : '';
+  const suppliedIdentityFields = [bankAccountNumber, bankCode, bvn].filter(Boolean).length;
+  if (suppliedIdentityFields > 0 && (suppliedIdentityFields !== 3 || !/^\d{10}$/.test(bankAccountNumber) || !/^\d{3}$/.test(bankCode) || !/^\d{11}$/.test(bvn))) {
+    return json({ error: { code: 'CUSTOMER_VALIDATION_FIELDS_INVALID', message: 'Enter a valid 10-digit bank account number, 3-digit bank code and 11-digit BVN together, or leave all three fields empty.' } }, 400);
+  }
   if (!phone) return json({ error: { code: 'PHONE_REQUIRED', message: 'Enter a valid Nigerian phone number before creating your dedicated account.' } }, 400);
   if (!name) return json({ error: { code: 'FULL_NAME_REQUIRED', message: 'Enter your first and last name in Profile, separated by a space, then save your profile before creating your dedicated account.' } }, 400);
 
@@ -728,45 +787,67 @@ async function createD1VirtualAccount(request: Request, env: Env) {
   try {
     let customerResponse = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(email)}`, 'GET');
     let customer = customerResponse.payload?.status === true && customerResponse.payload.data ? customerResponse.payload.data : null;
-    if (!customer && customerResponse.httpStatus !== 404) throw new Error('PAYSTACK_CUSTOMER_LOOKUP_FAILED');
-    if (!customer) {
-      customerResponse = await paystackApi<PaystackCustomer>(env, '/customer', 'POST', { email, ...name, phone });
-      if (customerResponse.payload?.status !== true || !customerResponse.payload.data) throw new Error('PAYSTACK_CUSTOMER_CREATE_FAILED');
-      customer = customerResponse.payload.data;
-    } else if (customer.customer_code) {
+    if (!customer && customerResponse.httpStatus !== 404) requirePaystackPayload(customerResponse, 'find customer');
+    if (customer?.customer_code) {
       const update = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(customer.customer_code)}`, 'PUT', { ...name, phone });
       if (update.payload?.status === true && update.payload.data) customer = update.payload.data;
     }
-    if (!customer.customer_code && typeof customer.id !== 'number') throw new Error('PAYSTACK_CUSTOMER_INCOMPLETE');
-    await storeDedicatedAccount(env, auth.user.uid, customer, null, 'pending');
-
     const preferredBank = env.PAYSTACK_VIRTUAL_ACCOUNT_BANK?.trim();
-    const accountResponse = await paystackApi<PaystackDedicatedAccount>(env, '/dedicated_account', 'POST', {
-      customer: customer.customer_code || customer.id,
-      ...(preferredBank ? { preferred_bank: preferredBank } : {}),
-    });
-    if (accountResponse.payload?.status !== true) throw new Error('PAYSTACK_DEDICATED_ACCOUNT_CREATE_FAILED');
-    const account = normalizeDedicatedAccount(accountResponse.payload.data);
-    if (account) {
+    const identity = suppliedIdentityFields === 3 ? { account_number: bankAccountNumber, bvn, bank_code: bankCode } : {};
+    let accountResponse: PaystackApiResult<PaystackDedicatedAccount>;
+    if (!customer) {
+      // Paystack's single-step flow creates, validates, and assigns the customer.
+      // It is required for integrations whose business category needs customer validation.
+      accountResponse = await paystackApi<PaystackDedicatedAccount>(env, '/dedicated_account/assign', 'POST', {
+        email,
+        ...name,
+        phone,
+        country: 'NG',
+        ...identity,
+        ...(preferredBank ? { preferred_bank: preferredBank } : {}),
+      });
+      requirePaystackPayload(accountResponse, 'assign dedicated account');
+      const assignedCustomerResponse = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(email)}`, 'GET');
+      customer = assignedCustomerResponse.payload?.status === true && assignedCustomerResponse.payload.data ? assignedCustomerResponse.payload.data : null;
+    } else {
+      if (!customer.customer_code && typeof customer.id !== 'number') throw new Error('PAYSTACK_CUSTOMER_INCOMPLETE');
+      if (suppliedIdentityFields === 3 && customer.customer_code) {
+        const validationResponse = await paystackApi<unknown>(env, `/customer/${encodeURIComponent(customer.customer_code)}/identification`, 'POST', {
+          first_name: name.first_name,
+          last_name: name.last_name,
+          type: 'bank_account',
+          value: bankAccountNumber,
+          country: 'NG',
+          bvn,
+          bank_code: bankCode,
+          account_number: bankAccountNumber,
+        });
+        requirePaystackPayload(validationResponse, 'validate customer identity');
+      }
+      // Existing customers use the documented customer-based endpoint. A customer
+      // already present on Paystack cannot safely be recreated by the assign flow.
+      accountResponse = await paystackApi<PaystackDedicatedAccount>(env, '/dedicated_account', 'POST', {
+        customer: customer.customer_code || customer.id,
+        ...(preferredBank ? { preferred_bank: preferredBank } : {}),
+      });
+      requirePaystackPayload(accountResponse, 'create dedicated account');
+    }
+    if (customer) await storeDedicatedAccount(env, auth.user.uid, customer, null, 'pending');
+
+    const account = normalizeDedicatedAccount(accountResponse.payload?.data);
+    if (account && customer) {
       await storeDedicatedAccount(env, auth.user.uid, customer, account, 'assigned');
       return json(publicVirtualAccount(await getStoredVirtualAccount(env, auth.user.uid)), 201);
     }
-
-    const refreshedResponse = customer.customer_code
-      ? await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(customer.customer_code)}`, 'GET')
-      : null;
-    const refreshedCustomer = refreshedResponse?.payload?.status === true && refreshedResponse.payload.data ? refreshedResponse.payload.data : customer;
-    const refreshedAccount = normalizeDedicatedAccount(refreshedCustomer.dedicated_account);
-    if (refreshedAccount) {
-      await storeDedicatedAccount(env, auth.user.uid, refreshedCustomer, refreshedAccount, 'assigned');
-      return json(publicVirtualAccount(await getStoredVirtualAccount(env, auth.user.uid)), 201);
-    }
+    const refreshed = await refreshStoredVirtualAccount(env, await getStoredVirtualAccount(env, auth.user.uid) as VirtualAccountRow);
+    if (refreshed?.status === 'assigned' && refreshed.account_number) return json(publicVirtualAccount(refreshed), 201);
     await env.DB.prepare("UPDATE paystack_virtual_accounts SET status='pending', updated_at=? WHERE user_id=?").bind(Date.now(), auth.user.uid).run();
     return json({ account: null, status: 'pending', message: 'Paystack is assigning your dedicated account. Refresh this page shortly.' }, 202);
   } catch (error) {
-    console.error('[paystack] virtual account creation failed', { code: error instanceof Error ? error.message : 'UNKNOWN' });
-    await env.DB.prepare("UPDATE paystack_virtual_accounts SET status='failed', failure_code='PAYSTACK_REQUEST_FAILED', updated_at=? WHERE user_id=? AND status<>'assigned'").bind(Date.now(), auth.user.uid).run();
-    return json({ error: { code: 'VIRTUAL_ACCOUNT_CREATION_FAILED', message: 'Paystack could not create your dedicated account. No wallet balance was changed.' } }, 502);
+    const failureCode = paystackFailureCode(error);
+    console.error('[paystack] virtual account creation failed', { code: failureCode, providerStatus: error instanceof PaystackProviderError ? error.httpStatus : undefined, providerMessage: error instanceof PaystackProviderError ? error.providerMessage : undefined });
+    await env.DB.prepare("UPDATE paystack_virtual_accounts SET status='failed', failure_code=?, updated_at=? WHERE user_id=? AND status<>'assigned'").bind(failureCode, Date.now(), auth.user.uid).run();
+    return json({ error: { code: failureCode, message: paystackFailureMessage(error) } }, 502);
   }
 }
 

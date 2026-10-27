@@ -40,10 +40,16 @@ export function getDedicatedVirtualAccount() {
   });
 }
 
-export function createDedicatedVirtualAccount(phone: string) {
+export type DedicatedVirtualAccountIdentity = {
+  bankAccountNumber: string;
+  bankCode: string;
+  bvn: string;
+};
+
+export function createDedicatedVirtualAccount(phone: string, identity?: DedicatedVirtualAccountIdentity) {
   return apiRequest<DedicatedVirtualAccount>('/api/cloudflare/paystack/virtual-account', {
     method: 'POST',
-    body: JSON.stringify({ phone }),
+    body: JSON.stringify({ phone, ...identity }),
   }, {
     authenticated: true,
     errorMessage: 'Paystack could not create your dedicated account.',
