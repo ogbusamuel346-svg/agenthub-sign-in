@@ -2,6 +2,7 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { verifyPaystackTransaction } from '../shared/paystack';
 import { isValidPaystackWebhookSignature, makeWebhookEventKey, validateSuccessfulPaystackTransaction } from '../shared/walletSecurity';
 import { getSupplierTransactionStatus, normalizeDataPlans, normalizeNetworks, normalizeExamProducts, normalizeUtilityProviders } from './catalog';
+import { adminActivityNotification, purchaseConfirmation, supportComplaintAcknowledgement, supportComplaintNotification, walletFundingConfirmation } from './emailTemplates';
 
 export interface Env {
   DB: {
@@ -28,15 +29,13 @@ export interface Env {
   TOPUPMATE_ADMIN_VIEW_TOKEN?: string;
   FIREBASE_PROJECT_ID?: string;
   PAYSTACK_FRONTEND_RETURN_URL?: string;
-  PAYSTACK_VIRTUAL_ACCOUNTS_ENABLED?: string;
-  PAYSTACK_VIRTUAL_ACCOUNT_BANK?: string;
   CLOUDFLARE_WALLET_CUTOVER?: string;
   CLOUDFLARE_FUNDING_ENABLED?: string;
   SUPPORT_EMAIL?: string;
   SUPPORT_FROM_EMAIL?: string;
-  BREVO_API_KEY?: string;
-  BREVO_SENDER_EMAIL?: string;
-  BREVO_SENDER_NAME?: string;
+  RESEND_API_KEY?: string;
+  RESEND_FROM_EMAIL?: string;
+  RESEND_ADMIN_EMAIL?: string;
   SUPPORT_MAILER: {
     send(message: {
       to: string;
@@ -125,17 +124,65 @@ async function requireUser(request: Request, env: Env) {
   return { user };
 }
 
-async function sendBrevoNotification(env: Env, kind: 'wallet_funding' | 'service_purchase', reference: string, userId: string) {
-  const apiKey = env.BREVO_API_KEY?.trim();
-  const senderEmail = env.BREVO_SENDER_EMAIL?.trim();
-  if (!apiKey || !senderEmail) return;
+type EmailNotificationKind = 'wallet_funding' | 'service_purchase';
 
+async function sendResendEmail(env: Env, input: { to: string | string[]; subject: string; html: string; text: string; replyTo?: string; tags?: Array<{ name: string; value: string }> }) {
+  const apiKey = env.RESEND_API_KEY?.trim();
+  const from = env.RESEND_FROM_EMAIL?.trim();
+  if (!apiKey || !from) return false;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8_000);
+  try {
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ from, to: input.to, subject: input.subject, html: input.html, text: input.text, ...(input.replyTo ? { reply_to: input.replyTo } : {}), tags: input.tags }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      console.error('Resend email request failed with status', response.status);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error('Resend email request failed:', error instanceof Error ? error.name : 'unknown');
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function sendAdminNotification(env: Env, kind: EmailNotificationKind, reference: string, userId: string) {
+  if (!env.RESEND_API_KEY?.trim() || !env.RESEND_FROM_EMAIL?.trim() || !env.RESEND_ADMIN_EMAIL?.trim()) return;
+  const now = Date.now();
+  try {
+    await env.DB.prepare("INSERT OR IGNORE INTO admin_email_notifications (event_kind, reference, status, attempts, created_at, updated_at) VALUES (?, ?, 'pending', 0, ?, ?)").bind(kind, reference, now, now).run();
+    const claimed = await env.DB.prepare("UPDATE admin_email_notifications SET status='sending', attempts=attempts+1, updated_at=? WHERE event_kind=? AND reference=? AND (status='pending' OR (status='sending' AND updated_at<?))").bind(now, kind, reference, now - 300_000).run();
+    if (((claimed as { meta?: { changes?: number } }).meta?.changes || 0) !== 1) return;
+    const record = kind === 'wallet_funding'
+      ? await env.DB.prepare('SELECT u.email, u.display_name, f.amount_minor, f.tx_ref AS reference, f.status FROM wallet_funding_transactions f JOIN users u ON u.id=f.user_id WHERE f.tx_ref=? AND f.user_id=?').bind(reference, userId).first<Record<string, unknown>>()
+      : await env.DB.prepare('SELECT u.email, u.display_name, s.total_amount_minor AS amount_minor, s.reference, s.service, s.provider_name, s.status FROM service_transactions s JOIN users u ON u.id=s.user_id WHERE s.reference=? AND s.user_id=?').bind(reference, userId).first<Record<string, unknown>>();
+    if (!record || record.status !== 'successful' || typeof record.email !== 'string') return;
+    const funding = kind === 'wallet_funding';
+    const service = funding ? 'Wallet funding' : String(record.service || 'Service');
+    const provider = funding ? 'Paystack' : String(record.provider_name || 'SamEduHub');
+    const name = typeof record.display_name === 'string' && record.display_name.trim() ? record.display_name.trim() : 'Customer';
+    const template = adminActivityNotification({ service, provider, amountMinor: Number(record.amount_minor), reference, customerEmail: record.email, customerName: name, kind: funding ? 'wallet funding' : 'product purchase' });
+    const sent = await sendResendEmail(env, { to: env.RESEND_ADMIN_EMAIL.trim(), subject: funding ? `Wallet funded: ${reference}` : `Purchase completed: ${reference}`, html: template.html, text: template.text, tags: [{ name: 'app', value: 'sameduhub' }, { name: 'audience', value: 'admin' }, { name: 'event', value: kind }] });
+    await env.DB.prepare(sent ? "UPDATE admin_email_notifications SET status='sent', sent_at=?, updated_at=? WHERE event_kind=? AND reference=? AND status='sending'" : "UPDATE admin_email_notifications SET status='pending', updated_at=? WHERE event_kind=? AND reference=? AND status='sending'").bind(...(sent ? [Date.now(), Date.now(), kind, reference] : [Date.now(), kind, reference])).run();
+  } catch (error) {
+    console.error('Admin email notification failed:', error instanceof Error ? error.name : 'unknown');
+    try { await env.DB.prepare("UPDATE admin_email_notifications SET status='pending', updated_at=? WHERE event_kind=? AND reference=? AND status='sending'").bind(Date.now(), kind, reference).run(); } catch { /* leave pending for a later retry */ }
+  }
+}
+
+async function sendEmailNotification(env: Env, kind: EmailNotificationKind, reference: string, userId: string) {
+  if (!env.RESEND_API_KEY?.trim() || !env.RESEND_FROM_EMAIL?.trim()) return;
   const now = Date.now();
   try {
     await env.DB.prepare("INSERT OR IGNORE INTO email_notifications (event_kind, reference, user_id, status, attempts, created_at, updated_at) VALUES (?, ?, ?, 'pending', 0, ?, ?)").bind(kind, reference, userId, now, now).run();
     const claimed = await env.DB.prepare("UPDATE email_notifications SET status='sending', attempts=attempts+1, updated_at=? WHERE event_kind=? AND reference=? AND user_id=? AND (status='pending' OR (status='sending' AND updated_at<?))").bind(now, kind, reference, userId, now - 300_000).run();
     if (((claimed as { meta?: { changes?: number } }).meta?.changes || 0) !== 1) return;
-
     const record = kind === 'wallet_funding'
       ? await env.DB.prepare('SELECT u.email, u.display_name, f.amount_minor, f.tx_ref AS reference, f.status FROM wallet_funding_transactions f JOIN users u ON u.id=f.user_id WHERE f.tx_ref=? AND f.user_id=?').bind(reference, userId).first<Record<string, unknown>>()
       : await env.DB.prepare('SELECT u.email, u.display_name, s.total_amount_minor AS amount_minor, s.reference, s.service, s.provider_name, s.status FROM service_transactions s JOIN users u ON u.id=s.user_id WHERE s.reference=? AND s.user_id=?').bind(reference, userId).first<Record<string, unknown>>();
@@ -143,51 +190,37 @@ async function sendBrevoNotification(env: Env, kind: 'wallet_funding' | 'service
       await env.DB.prepare("UPDATE email_notifications SET status='pending', updated_at=? WHERE event_kind=? AND reference=? AND status='sending'").bind(Date.now(), kind, reference).run();
       return;
     }
-
-    const amount = `NGN ${(Number(record.amount_minor) / 100).toFixed(2)}`;
     const funding = kind === 'wallet_funding';
-    const subject = funding ? 'Your SamEduHub wallet has been funded' : 'Your SamEduHub purchase is confirmed';
-    const description = funding ? 'Your wallet funding was confirmed and credited.' : `${String(record.service || 'Service')} purchase from ${String(record.provider_name || 'SamEduHub')} was confirmed.`;
     const name = typeof record.display_name === 'string' && record.display_name.trim() ? record.display_name.trim() : 'Customer';
-    const textContent = `Hello ${name},\n\n${description}\nAmount: ${amount}\nReference: ${reference}\n\nYou can review your transaction in your SamEduHub dashboard.`;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8_000);
-    let response: Response;
-    try {
-      response = await fetch('https://api.brevo.com/v3/smtp/email', {
-        method: 'POST',
-        headers: { 'api-key': apiKey, 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({
-          sender: { email: senderEmail, name: env.BREVO_SENDER_NAME?.trim() || 'SamEduHub' },
-          to: [{ email: record.email, name }],
-          subject,
-          textContent,
-          tags: ['sameduhub', funding ? 'wallet-funding' : 'purchase-confirmation'],
-        }),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timeout);
-    }
-    if (!response.ok) {
-      console.error('Brevo notification request failed with status', response.status);
+    const service = funding ? 'Wallet funding' : String(record.service || 'Service');
+    const provider = funding ? 'Paystack' : String(record.provider_name || 'SamEduHub');
+    const template = funding
+      ? walletFundingConfirmation({ name, amountMinor: Number(record.amount_minor), reference })
+      : purchaseConfirmation({ name, service, provider, amountMinor: Number(record.amount_minor), reference });
+    const sent = await sendResendEmail(env, { to: record.email, subject: funding ? 'Your SamEduHub wallet has been funded' : `Your ${service} purchase is confirmed`, html: template.html, text: template.text, tags: [{ name: 'app', value: 'sameduhub' }, { name: 'audience', value: 'customer' }, { name: 'event', value: kind }] });
+    if (!sent) {
       await env.DB.prepare("UPDATE email_notifications SET status='pending', updated_at=? WHERE event_kind=? AND reference=? AND status='sending'").bind(Date.now(), kind, reference).run();
       return;
     }
     await env.DB.prepare("UPDATE email_notifications SET status='sent', sent_at=?, updated_at=? WHERE event_kind=? AND reference=? AND status='sending'").bind(Date.now(), Date.now(), kind, reference).run();
+    await sendAdminNotification(env, kind, reference, userId);
   } catch (error) {
-    console.error('Brevo notification could not be sent:', error instanceof Error ? error.message : 'unknown error');
+    console.error('Customer email notification failed:', error instanceof Error ? error.name : 'unknown');
     try { await env.DB.prepare("UPDATE email_notifications SET status='pending', updated_at=? WHERE event_kind=? AND reference=? AND status='sending'").bind(Date.now(), kind, reference).run(); } catch { /* leave pending for a later retry */ }
   }
 }
 
-async function retryPendingBrevoNotifications(env: Env) {
-  if (!env.BREVO_API_KEY?.trim() || !env.BREVO_SENDER_EMAIL?.trim()) return;
+async function retryPendingEmailNotifications(env: Env) {
+  if (!env.RESEND_API_KEY?.trim() || !env.RESEND_FROM_EMAIL?.trim()) return;
   try {
-    const pending = await env.DB.prepare("SELECT event_kind, reference, user_id FROM email_notifications WHERE status='pending' OR (status='sending' AND updated_at<?) ORDER BY created_at LIMIT 50").bind(Date.now() - 300_000).all<{ event_kind: 'wallet_funding' | 'service_purchase'; reference: string; user_id: string }>();
-    await Promise.all(pending.results.map(item => sendBrevoNotification(env, item.event_kind, item.reference, item.user_id)));
+    const pending = await env.DB.prepare("SELECT event_kind, reference, user_id FROM email_notifications WHERE status='pending' OR (status='sending' AND updated_at<?) ORDER BY created_at LIMIT 50").bind(Date.now() - 300_000).all<{ event_kind: EmailNotificationKind; reference: string; user_id: string }>();
+    await Promise.all(pending.results.map(item => sendEmailNotification(env, item.event_kind, item.reference, item.user_id)));
+    if (env.RESEND_ADMIN_EMAIL?.trim()) {
+      const adminPending = await env.DB.prepare("SELECT event_kind, reference FROM admin_email_notifications WHERE status='pending' OR (status='sending' AND updated_at<?) ORDER BY created_at LIMIT 50").bind(Date.now() - 300_000).all<{ event_kind: EmailNotificationKind; reference: string }>();
+      await Promise.all(adminPending.results.map(item => env.DB.prepare('SELECT user_id FROM email_notifications WHERE event_kind=? AND reference=?').bind(item.event_kind, item.reference).first<{ user_id: string }>().then(row => row ? sendAdminNotification(env, item.event_kind, item.reference, row.user_id) : undefined)));
+    }
   } catch {
-    console.error('Brevo notification retry batch could not be loaded.');
+    console.error('Resend notification retry batch could not be loaded.');
   }
 }
 
@@ -441,7 +474,7 @@ async function getD1TransactionStatus(request: Request, env: Env) {
     }
     let savedDelivery: unknown = [];
     try { savedDelivery = record.pins_json ? JSON.parse(String(record.pins_json)) : []; } catch { savedDelivery = []; }
-    if (status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
+    if (status === 'successful') await sendEmailNotification(env, 'service_purchase', reference, auth.user.uid);
     const transaction = { reference, service: record.service, product: { id: record.provider_id, provider: record.provider_name }, providerId: record.provider_id, providerName: record.provider_name, quantity: record.quantity, unitPrice: Number(record.unit_price_minor) / 100, totalAmount: Number(record.total_amount_minor) / 100, currency: record.currency, status, providerStatus, hasDelivery: status === 'successful' && ((Array.isArray(savedDelivery) && savedDelivery.length > 0) || delivery.length > 0), failureCode: record.failure_code || null, createdAt: record.created_at, updatedAt: now, debitedAt: record.debited_at || null, refundedAt: record.refunded_at || null };
     return json({ reference, status, providerStatus, transaction, checkedAt: new Date().toISOString() });
   } catch {
@@ -535,358 +568,6 @@ function paystackReady(env: Env, expectedMode?: 'test' | 'live') {
   }
 }
 
-type PaystackApiPayload<T = unknown> = { status?: boolean; message?: string; data?: T } | null;
-type PaystackApiResult<T = unknown> = { httpStatus: number; payload: PaystackApiPayload<T> };
-
-class PaystackProviderError extends Error {
-  constructor(readonly operation: string, readonly httpStatus: number, readonly providerMessage: string) {
-    super(`${operation} failed (${httpStatus})`);
-    this.name = 'PaystackProviderError';
-  }
-}
-
-type PaystackCustomer = {
-  id?: number;
-  customer_code?: string;
-  email?: string;
-  first_name?: string | null;
-  last_name?: string | null;
-  phone?: string | null;
-  dedicated_account?: PaystackDedicatedAccount | null;
-};
-
-type PaystackDedicatedAccount = {
-  id?: number;
-  account_name?: string;
-  account_number?: string;
-  currency?: string;
-  active?: boolean | number;
-  assigned?: boolean | number;
-  bank?: { name?: string; slug?: string } | null;
-};
-
-type VirtualAccountRow = {
-  user_id: string;
-  customer_id: number | null;
-  customer_code: string | null;
-  account_id: number | null;
-  account_number: string | null;
-  account_name: string | null;
-  bank_name: string | null;
-  bank_slug: string | null;
-  currency: string;
-  status: 'creating' | 'pending' | 'assigned' | 'failed';
-  failure_code: string | null;
-  created_at: number;
-  updated_at: number;
-};
-
-function virtualAccountsReady(env: Env) {
-  return env.PAYSTACK_VIRTUAL_ACCOUNTS_ENABLED === 'true'
-    && env.CLOUDFLARE_FUNDING_ENABLED === 'true'
-    && paystackReady(env);
-}
-
-async function paystackApi<T>(env: Env, path: string, method: 'GET' | 'POST' | 'PUT', body?: unknown): Promise<PaystackApiResult<T>> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12_000);
-  try {
-    const response = await fetch(`https://api.paystack.co${path}`, {
-      method,
-      headers: { Authorization: `Bearer ${paystackSecret(env)}`, Accept: 'application/json', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: controller.signal,
-    });
-    const payload = await response.json().catch(() => null) as PaystackApiPayload<T>;
-    return { httpStatus: response.status, payload };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function requirePaystackPayload<T>(result: PaystackApiResult<T>, operation: string) {
-  if (result.payload?.status !== true) {
-    throw new PaystackProviderError(operation, result.httpStatus, result.payload?.message || 'Paystack rejected the request.');
-  }
-  return result.payload.data;
-}
-
-function paystackFailureCode(error: unknown) {
-  if (!(error instanceof PaystackProviderError)) return 'PAYSTACK_REQUEST_FAILED';
-  const message = error.providerMessage.toLowerCase();
-  if (error.httpStatus === 401 || error.httpStatus === 403) return 'PAYSTACK_CREDENTIALS_REJECTED';
-  if (error.httpStatus === 429) return 'PAYSTACK_RATE_LIMITED';
-  if (message.includes('bvn') || message.includes('identif') || message.includes('bank account')) return 'PAYSTACK_CUSTOMER_VALIDATION_REQUIRED';
-  if (message.includes('dedicated') && (message.includes('activat') || message.includes('available') || message.includes('enable'))) return 'PAYSTACK_DVA_NOT_ACTIVE';
-  return 'PAYSTACK_REQUEST_FAILED';
-}
-
-function paystackFailureMessage(error: unknown) {
-  if (!(error instanceof PaystackProviderError)) return 'Paystack could not create your dedicated account. No wallet balance was changed.';
-  const code = paystackFailureCode(error);
-  if (code === 'PAYSTACK_CREDENTIALS_REJECTED') return 'The Paystack server credential was rejected. Confirm the live secret is configured on this Worker.';
-  if (code === 'PAYSTACK_RATE_LIMITED') return 'Paystack is temporarily rate-limiting account requests. Wait a moment and try again.';
-  if (code === 'PAYSTACK_CUSTOMER_VALIDATION_REQUIRED') return 'Paystack requires customer identity validation before issuing this dedicated account. Complete the requested bank-account verification details and try again.';
-  if (code === 'PAYSTACK_DVA_NOT_ACTIVE') return 'Dedicated Virtual Accounts are not active for this Paystack live integration. Activate the feature in Paystack before trying again.';
-  if (error.httpStatus >= 500) return 'Paystack is temporarily unavailable. No wallet balance was changed; try again later.';
-  return 'Paystack rejected the dedicated-account request. Confirm the customer profile and Paystack DVA settings, then try again.';
-}
-
-function normalizePaystackPhone(value: unknown) {
-  if (typeof value !== 'string') return null;
-  const compact = value.trim().replace(/[\s()-]/g, '');
-  if (/^0\d{10}$/.test(compact)) return `+234${compact.slice(1)}`;
-  if (/^234\d{10}$/.test(compact)) return `+${compact}`;
-  if (/^\+234\d{10}$/.test(compact)) return compact;
-  return null;
-}
-
-function splitPaystackName(value: unknown) {
-  if (typeof value !== 'string') return null;
-  const parts = value.trim().split(/\s+/).filter(Boolean);
-  if (parts.length < 2) return null;
-  return { first_name: parts[0], last_name: parts.slice(1).join(' ') };
-}
-
-function normalizeDedicatedAccount(value: unknown): PaystackDedicatedAccount | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const candidate = value as PaystackDedicatedAccount;
-  if (typeof candidate.account_number !== 'string' || !/^\d{10}$/.test(candidate.account_number)) return null;
-  if (candidate.currency && candidate.currency !== 'NGN') return null;
-  const assigned = candidate.assigned === true || candidate.assigned === 1;
-  const active = candidate.active === undefined || candidate.active === true || candidate.active === 1;
-  if (!assigned || !active) return null;
-  return candidate;
-}
-
-function publicVirtualAccount(row: VirtualAccountRow | null) {
-  if (!row || row.status !== 'assigned' || !row.account_number) return { account: null, status: row?.status || 'not_created' };
-  return {
-    status: 'assigned',
-    account: {
-      accountNumber: row.account_number,
-      accountName: row.account_name,
-      bankName: row.bank_name,
-      currency: row.currency,
-    },
-  };
-}
-
-async function storeDedicatedAccount(env: Env, userId: string, customer: PaystackCustomer, account: PaystackDedicatedAccount | null, status: 'pending' | 'assigned') {
-  await env.DB.prepare(`UPDATE paystack_virtual_accounts
-    SET customer_id=COALESCE(?, customer_id), customer_code=COALESCE(?, customer_code),
-        account_id=COALESCE(?, account_id), account_number=COALESCE(?, account_number),
-        account_name=COALESCE(?, account_name), bank_name=COALESCE(?, bank_name),
-        bank_slug=COALESCE(?, bank_slug), currency=COALESCE(?, currency),
-        status=?, failure_code=NULL, updated_at=? WHERE user_id=?`)
-    .bind(
-      typeof customer.id === 'number' ? customer.id : null,
-      typeof customer.customer_code === 'string' ? customer.customer_code : null,
-      typeof account?.id === 'number' ? account.id : null,
-      account?.account_number || null,
-      account?.account_name || null,
-      account?.bank?.name || null,
-      account?.bank?.slug || null,
-      account?.currency || null,
-      status,
-      Date.now(),
-      userId,
-    ).run();
-}
-
-async function getStoredVirtualAccount(env: Env, userId: string) {
-  return env.DB.prepare('SELECT user_id, customer_id, customer_code, account_id, account_number, account_name, bank_name, bank_slug, currency, status, failure_code, created_at, updated_at FROM paystack_virtual_accounts WHERE user_id=?').bind(userId).first<VirtualAccountRow>();
-}
-
-async function refreshStoredVirtualAccount(env: Env, row: VirtualAccountRow) {
-  if (row.status === 'assigned') return row;
-  let customer: PaystackCustomer | null = null;
-  if (row.customer_code) {
-    const response = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(row.customer_code)}`, 'GET');
-    customer = response.payload?.status === true && response.payload.data ? response.payload.data : null;
-  } else {
-    const user = await env.DB.prepare('SELECT email FROM users WHERE id=?').bind(row.user_id).first<{ email: string }>();
-    if (user?.email) {
-      const response = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(user.email)}`, 'GET');
-      customer = response.payload?.status === true && response.payload.data ? response.payload.data : null;
-    }
-  }
-  let account = normalizeDedicatedAccount(customer?.dedicated_account);
-  if (!account && typeof customer?.id === 'number') {
-    const accountsResponse = await paystackApi<PaystackDedicatedAccount[]>(env, `/dedicated_account?customer=${encodeURIComponent(String(customer.id))}`, 'GET');
-    const accounts = requirePaystackPayload(accountsResponse, 'list dedicated accounts');
-    account = Array.isArray(accounts) ? accounts.map(normalizeDedicatedAccount).find((candidate): candidate is PaystackDedicatedAccount => Boolean(candidate)) || null : null;
-  }
-  if (customer && account) {
-    await storeDedicatedAccount(env, row.user_id, customer, account, 'assigned');
-    return getStoredVirtualAccount(env, row.user_id);
-  }
-  if (customer && !row.customer_code) {
-    await storeDedicatedAccount(env, row.user_id, customer, null, 'pending');
-  }
-  return row;
-}
-
-async function getD1VirtualAccount(request: Request, env: Env) {
-  const auth = await requireUser(request, env);
-  if (!auth.user) return auth.response!;
-  if (!virtualAccountsReady(env)) return json({ error: { code: 'PAYSTACK_VIRTUAL_ACCOUNTS_DISABLED', message: 'Dedicated account funding is not enabled in this environment.' } }, 503);
-  try {
-    const stored = await getStoredVirtualAccount(env, auth.user.uid);
-    const refreshed = stored ? await refreshStoredVirtualAccount(env, stored).catch(() => stored) : null;
-    return json(publicVirtualAccount(refreshed));
-  } catch {
-    return json({ error: { code: 'VIRTUAL_ACCOUNT_UNAVAILABLE', message: 'Your dedicated account could not be loaded right now.' } }, 503);
-  }
-}
-
-async function createD1VirtualAccount(request: Request, env: Env) {
-  const auth = await requireUser(request, env);
-  if (!auth.user) return auth.response!;
-  if (!virtualAccountsReady(env)) return json({ error: { code: 'PAYSTACK_VIRTUAL_ACCOUNTS_DISABLED', message: 'Dedicated account funding is not enabled in this environment.' } }, 503);
-
-  const body = await request.json().catch(() => null) as { phone?: unknown; bankAccountNumber?: unknown; bankCode?: unknown; bvn?: unknown } | null;
-  const user = await env.DB.prepare('SELECT display_name, phone FROM users WHERE id=?').bind(auth.user.uid).first<{ display_name: string | null; phone: string | null }>();
-  const phone = normalizePaystackPhone(body?.phone) || normalizePaystackPhone(user?.phone);
-  const name = splitPaystackName(user?.display_name || auth.user.name);
-  const bankAccountNumber = typeof body?.bankAccountNumber === 'string' ? body.bankAccountNumber.trim() : '';
-  const bankCode = typeof body?.bankCode === 'string' ? body.bankCode.trim() : '';
-  const bvn = typeof body?.bvn === 'string' ? body.bvn.trim() : '';
-  const suppliedIdentityFields = [bankAccountNumber, bankCode, bvn].filter(Boolean).length;
-  if (suppliedIdentityFields > 0 && (suppliedIdentityFields !== 3 || !/^\d{10}$/.test(bankAccountNumber) || !/^\d{3}$/.test(bankCode) || !/^\d{11}$/.test(bvn))) {
-    return json({ error: { code: 'CUSTOMER_VALIDATION_FIELDS_INVALID', message: 'Enter a valid 10-digit bank account number, 3-digit bank code and 11-digit BVN together, or leave all three fields empty.' } }, 400);
-  }
-  if (!phone) return json({ error: { code: 'PHONE_REQUIRED', message: 'Enter a valid Nigerian phone number before creating your dedicated account.' } }, 400);
-  if (!name) return json({ error: { code: 'FULL_NAME_REQUIRED', message: 'Enter your first and last name in Profile, separated by a space, then save your profile before creating your dedicated account.' } }, 400);
-
-  const now = Date.now();
-  const email = auth.user.email?.trim().toLowerCase();
-  if (!email) return json({ error: { code: 'EMAIL_REQUIRED', message: 'A verified account email is required before creating a dedicated account.' } }, 400);
-  await env.DB.prepare("INSERT INTO users (id, email, display_name, phone, email_verified, identity_provider, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'firebase', ?, ?) ON CONFLICT(id) DO UPDATE SET email=excluded.email, display_name=COALESCE(excluded.display_name, users.display_name), phone=excluded.phone, email_verified=excluded.email_verified, updated_at=excluded.updated_at")
-    .bind(auth.user.uid, email, auth.user.name || user?.display_name || null, phone, auth.user.emailVerified ? 1 : 0, now, now).run();
-  await env.DB.prepare('INSERT INTO wallets (user_id, balance_minor, updated_at) VALUES (?, 0, ?) ON CONFLICT(user_id) DO NOTHING').bind(auth.user.uid, now).run();
-
-  let stored = await getStoredVirtualAccount(env, auth.user.uid);
-  if (stored?.status === 'assigned' && stored.account_number) return json(publicVirtualAccount(stored));
-  if (stored?.status === 'creating' && now - stored.updated_at < 120_000) return json({ ...publicVirtualAccount(stored), message: 'Your dedicated account request is already being processed.' }, 202);
-
-  if (stored?.customer_code) {
-    try {
-      const refreshed = await refreshStoredVirtualAccount(env, stored);
-      if (refreshed?.status === 'assigned' && refreshed.account_number) return json(publicVirtualAccount(refreshed));
-    } catch { /* Continue with the existing customer record below. */ }
-  }
-
-  const claimed = await env.DB.prepare("INSERT INTO paystack_virtual_accounts (user_id, status, currency, created_at, updated_at) VALUES (?, 'creating', 'NGN', ?, ?) ON CONFLICT(user_id) DO UPDATE SET status='creating', failure_code=NULL, updated_at=? WHERE paystack_virtual_accounts.status <> 'assigned' AND (paystack_virtual_accounts.status='failed' OR paystack_virtual_accounts.updated_at<?)")
-    .bind(auth.user.uid, now, now, now, now - 120_000).run() as { meta?: { changes?: number } };
-  if (Number(claimed.meta?.changes || 0) !== 1) {
-    stored = await getStoredVirtualAccount(env, auth.user.uid);
-    return json({ ...publicVirtualAccount(stored), message: 'Your dedicated account request is already being processed.' }, 202);
-  }
-
-  try {
-    let customerResponse = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(email)}`, 'GET');
-    let customer = customerResponse.payload?.status === true && customerResponse.payload.data ? customerResponse.payload.data : null;
-    if (!customer && customerResponse.httpStatus !== 404) requirePaystackPayload(customerResponse, 'find customer');
-    if (customer?.customer_code) {
-      const update = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(customer.customer_code)}`, 'PUT', { ...name, phone });
-      if (update.payload?.status === true && update.payload.data) customer = update.payload.data;
-    }
-    const preferredBank = env.PAYSTACK_VIRTUAL_ACCOUNT_BANK?.trim();
-    const identity = suppliedIdentityFields === 3 ? { account_number: bankAccountNumber, bvn, bank_code: bankCode } : {};
-    let accountResponse: PaystackApiResult<PaystackDedicatedAccount>;
-    if (!customer) {
-      // Paystack's single-step flow creates, validates, and assigns the customer.
-      // It is required for integrations whose business category needs customer validation.
-      accountResponse = await paystackApi<PaystackDedicatedAccount>(env, '/dedicated_account/assign', 'POST', {
-        email,
-        ...name,
-        phone,
-        country: 'NG',
-        ...identity,
-        ...(preferredBank ? { preferred_bank: preferredBank } : {}),
-      });
-      requirePaystackPayload(accountResponse, 'assign dedicated account');
-      const assignedCustomerResponse = await paystackApi<PaystackCustomer>(env, `/customer/${encodeURIComponent(email)}`, 'GET');
-      customer = assignedCustomerResponse.payload?.status === true && assignedCustomerResponse.payload.data ? assignedCustomerResponse.payload.data : null;
-    } else {
-      if (!customer.customer_code && typeof customer.id !== 'number') throw new Error('PAYSTACK_CUSTOMER_INCOMPLETE');
-      if (suppliedIdentityFields === 3 && customer.customer_code) {
-        const validationResponse = await paystackApi<unknown>(env, `/customer/${encodeURIComponent(customer.customer_code)}/identification`, 'POST', {
-          first_name: name.first_name,
-          last_name: name.last_name,
-          type: 'bank_account',
-          value: bankAccountNumber,
-          country: 'NG',
-          bvn,
-          bank_code: bankCode,
-          account_number: bankAccountNumber,
-        });
-        requirePaystackPayload(validationResponse, 'validate customer identity');
-      }
-      // Existing customers use the documented customer-based endpoint. A customer
-      // already present on Paystack cannot safely be recreated by the assign flow.
-      accountResponse = await paystackApi<PaystackDedicatedAccount>(env, '/dedicated_account', 'POST', {
-        customer: customer.customer_code || customer.id,
-        ...(preferredBank ? { preferred_bank: preferredBank } : {}),
-      });
-      requirePaystackPayload(accountResponse, 'create dedicated account');
-    }
-    if (customer) await storeDedicatedAccount(env, auth.user.uid, customer, null, 'pending');
-
-    const account = normalizeDedicatedAccount(accountResponse.payload?.data);
-    if (account && customer) {
-      await storeDedicatedAccount(env, auth.user.uid, customer, account, 'assigned');
-      return json(publicVirtualAccount(await getStoredVirtualAccount(env, auth.user.uid)), 201);
-    }
-    const refreshed = await refreshStoredVirtualAccount(env, await getStoredVirtualAccount(env, auth.user.uid) as VirtualAccountRow);
-    if (refreshed?.status === 'assigned' && refreshed.account_number) return json(publicVirtualAccount(refreshed), 201);
-    await env.DB.prepare("UPDATE paystack_virtual_accounts SET status='pending', updated_at=? WHERE user_id=?").bind(Date.now(), auth.user.uid).run();
-    return json({ account: null, status: 'pending', message: 'Paystack is assigning your dedicated account. Refresh this page shortly.' }, 202);
-  } catch (error) {
-    const failureCode = paystackFailureCode(error);
-    console.error('[paystack] virtual account creation failed', { code: failureCode, providerStatus: error instanceof PaystackProviderError ? error.httpStatus : undefined, providerMessage: error instanceof PaystackProviderError ? error.providerMessage : undefined });
-    await env.DB.prepare("UPDATE paystack_virtual_accounts SET status='failed', failure_code=?, updated_at=? WHERE user_id=? AND status<>'assigned'").bind(failureCode, Date.now(), auth.user.uid).run();
-    return json({ error: { code: failureCode, message: paystackFailureMessage(error) } }, 502);
-  }
-}
-
-async function creditD1VirtualAccountDeposit(env: Env, payload: {
-  data?: {
-    id?: unknown;
-    amount?: unknown;
-    currency?: unknown;
-    status?: unknown;
-    authorization?: { channel?: unknown; receiver_bank_account_number?: unknown };
-    customer?: { customer_code?: unknown; email?: unknown };
-  };
-}) {
-  const data = payload.data;
-  const transactionId = data?.id === undefined ? '' : String(data.id);
-  const amountMinor = Number(data?.amount);
-  const accountNumber = typeof data?.authorization?.receiver_bank_account_number === 'string' ? data.authorization.receiver_bank_account_number : '';
-  const customerCode = typeof data?.customer?.customer_code === 'string' ? data.customer.customer_code : '';
-  if (!/^\d+$/.test(transactionId) || !Number.isSafeInteger(amountMinor) || amountMinor <= 0 || data?.currency !== 'NGN' || data?.status !== 'success') return { status: 'ignored' };
-  if (!accountNumber && !customerCode) return { status: 'ignored' };
-
-  const record = accountNumber
-    ? await env.DB.prepare('SELECT v.user_id, v.account_number, v.customer_code, u.email, u.display_name FROM paystack_virtual_accounts v JOIN users u ON u.id=v.user_id WHERE v.account_number=? AND v.status=\'assigned\'').bind(accountNumber).first<{ user_id: string; account_number: string; customer_code: string | null; email: string; display_name: string | null }>()
-    : await env.DB.prepare('SELECT v.user_id, v.account_number, v.customer_code, u.email, u.display_name FROM paystack_virtual_accounts v JOIN users u ON u.id=v.user_id WHERE v.customer_code=? AND v.status=\'assigned\'').bind(customerCode).first<{ user_id: string; account_number: string | null; customer_code: string | null; email: string; display_name: string | null }>();
-  if (!record) return { status: 'unmatched' };
-
-  const txRef = `VA-${transactionId}`;
-  const now = Date.now();
-  await env.DB.batch([
-    env.DB.prepare("INSERT OR IGNORE INTO wallet_funding_transactions (tx_ref, user_id, amount_minor, currency, customer_email, customer_name, status, provider_transaction_id, created_at, updated_at) VALUES (?, ?, ?, 'NGN', ?, ?, 'processing', ?, ?, ?)").bind(txRef, record.user_id, amountMinor, record.email, record.display_name || 'Customer', transactionId, now, now),
-    env.DB.prepare("INSERT OR IGNORE INTO wallet_ledger (id, user_id, tx_ref, amount_minor, currency, provider_transaction_id, created_at) VALUES (?, ?, ?, ?, 'NGN', ?, ?)").bind(`wallet:${txRef}`, record.user_id, txRef, amountMinor, transactionId, now),
-    env.DB.prepare("UPDATE wallets SET balance_minor=balance_minor+?, updated_at=? WHERE user_id=? AND EXISTS (SELECT 1 FROM wallet_ledger WHERE id=? AND tx_ref=? AND provider_transaction_id=?) AND EXISTS (SELECT 1 FROM wallet_funding_transactions WHERE tx_ref=? AND credited_at IS NULL)").bind(amountMinor, now, record.user_id, `wallet:${txRef}`, txRef, transactionId, txRef),
-    env.DB.prepare("UPDATE wallet_funding_transactions SET status='successful', provider_transaction_id=?, credited_at=COALESCE(credited_at, ?), updated_at=? WHERE tx_ref=?").bind(transactionId, now, now, txRef),
-  ]);
-  await env.DB.prepare('INSERT OR IGNORE INTO paystack_virtual_account_events (event_key, event, transaction_id, account_number, customer_code, amount_minor, received_at) VALUES (?, \'charge.success\', ?, ?, ?, ?, ?)').bind(`charge.success:${transactionId}:success`, transactionId, accountNumber || record.account_number, customerCode || record.customer_code, amountMinor, now).run();
-  await sendBrevoNotification(env, 'wallet_funding', txRef, record.user_id);
-  return { status: 'successful', txRef };
-}
-
 function topupmateUrlMatchesMode(env: Env, mode: 'sandbox' | 'live') {
   if (!env.TOPUPMATE_API_BASE_URL) return false;
   try {
@@ -954,7 +635,7 @@ async function creditD1Funding(env: Env, txRef: string, expectedTransactionId?: 
   const record = await env.DB.prepare('SELECT tx_ref, user_id, amount_minor, currency, customer_email, customer_name, status, created_at, updated_at FROM wallet_funding_transactions WHERE tx_ref=?').bind(txRef).first<{ tx_ref: string; user_id: string; amount_minor: number; currency: 'NGN'; customer_email: string; customer_name: string; status: string; created_at: number; updated_at: number }>();
   if (!record) return { status: 'ignored' };
   if (record.status === 'successful') {
-    await sendBrevoNotification(env, 'wallet_funding', record.tx_ref, record.user_id);
+    await sendEmailNotification(env, 'wallet_funding', record.tx_ref, record.user_id);
     return { status: 'already_processed' };
   }
   const transaction = await verifyPaystackTransaction(record.tx_ref, paystackSecret(env));
@@ -969,7 +650,7 @@ async function creditD1Funding(env: Env, txRef: string, expectedTransactionId?: 
   ]);
   const ledgerInserted = credit[0] as { meta?: { changes?: number } };
   if (ledgerInserted.meta?.changes !== 1) return { status: 'already_processed' };
-  await sendBrevoNotification(env, 'wallet_funding', record.tx_ref, record.user_id);
+  await sendEmailNotification(env, 'wallet_funding', record.tx_ref, record.user_id);
   return { status: 'successful' };
 }
 
@@ -985,21 +666,10 @@ async function paystackWebhook(request: Request, env: Env) {
       amount?: unknown;
       currency?: unknown;
       status?: unknown;
-      authorization?: { channel?: unknown; receiver_bank_account_number?: unknown };
-      customer?: { customer_code?: unknown; email?: unknown };
     };
   } | null = null;
   try { payload = JSON.parse(new TextDecoder().decode(rawBody)); } catch { return json({ ok: false }, 400); }
   const event = typeof payload?.event === 'string' ? payload.event : '';
-  if (event === 'charge.success' && payload?.data?.authorization?.channel === 'dedicated_nuban' && env.PAYSTACK_VIRTUAL_ACCOUNTS_ENABLED === 'true') {
-    try {
-      const result = await creditD1VirtualAccountDeposit(env, payload);
-      return json({ ok: true, ...result });
-    } catch (error) {
-      console.error('[paystack] dedicated account webhook processing failed', { code: error instanceof Error ? error.message : 'UNKNOWN' });
-      return json({ ok: false }, 500);
-    }
-  }
   const transactionId = payload?.data?.id === undefined ? '' : String(payload.data.id);
   const txRef = typeof payload?.data?.reference === 'string' ? payload.data.reference : '';
   const status = typeof payload?.data?.status === 'string' ? payload.data.status : '';
@@ -1153,7 +823,7 @@ async function purchaseD1Data(request: Request, env: Env) {
   if (existing) {
     if (existing.service !== 'data' || String(existing.provider_id) !== providerId || Number(existing.quantity) !== 1) return json({ error: { code: 'REFERENCE_CONFLICT', message: 'This order reference belongs to another purchase.' } }, 409);
     if (existing.status === 'failed') return json({ error: { code: 'PREVIOUS_ORDER_FAILED', message: 'This order failed and its wallet debit was refunded. Start a new order.' } }, 409);
-    if (existing.status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
+    if (existing.status === 'successful') await sendEmailNotification(env, 'service_purchase', reference, auth.user.uid);
     return json({ reference, status: existing.status, plan: { id: planId, network: networkId, name: providerName }, unitPrice: Number(existing.unit_price_minor) / 100, totalAmount: Number(existing.total_amount_minor) / 100, message: 'This order reference has already been recorded.' }, existing.status === 'successful' ? 200 : 202);
   }
   const now = Date.now();
@@ -1179,7 +849,7 @@ async function purchaseD1Data(request: Request, env: Env) {
   }
   const status = providerStatus === 'successful' ? 'successful' : 'pending';
   await env.DB.prepare('UPDATE service_transactions SET status=?,provider_status=?,updated_at=? WHERE user_id=? AND reference=?').bind(status, providerStatus, Date.now(), auth.user.uid, reference).run();
-  if (status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
+  if (status === 'successful') await sendEmailNotification(env, 'service_purchase', reference, auth.user.uid);
   return json({ reference, status, plan: { id: planId, network: networkId, name: providerName }, unitPrice: retailPrice, totalAmount: retailPrice, message: status === 'successful' ? 'Data delivery was confirmed by the supplier.' : 'Your data purchase is awaiting supplier confirmation.' }, status === 'successful' ? 200 : 202);
 }
 
@@ -1218,7 +888,7 @@ async function purchaseD1ExamPin(request: Request, env: Env) {
   if (existing) {
     if (existing.service !== 'exam-pin' || String(existing.provider_id) !== providerId || Number(existing.quantity) !== quantity) return json({ error: { code: 'REFERENCE_CONFLICT', message: 'This order reference belongs to another purchase.' } }, 409);
     if (existing.status === 'failed') return json({ error: { code: 'PREVIOUS_ORDER_FAILED', message: 'This order failed and its wallet debit was refunded. Start a new order.' } }, 409);
-    if (existing.status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
+    if (existing.status === 'successful') await sendEmailNotification(env, 'service_purchase', reference, auth.user.uid);
     let delivery: unknown = [];
     try { delivery = existing.pins_json ? JSON.parse(String(existing.pins_json)) : []; } catch { delivery = []; }
     return json({ reference, status: existing.status === 'successful' ? 'successful' : 'pending', product: { id: existing.provider_id, provider: existing.provider_name }, quantity, unitPrice: Number(existing.unit_price_minor) / 100, totalAmount: Number(existing.total_amount_minor) / 100, hasDelivery: existing.status === 'successful' && Array.isArray(delivery) && delivery.length > 0, message: 'This order reference has already been recorded.' }, existing.status === 'successful' ? 200 : 202);
@@ -1252,7 +922,7 @@ async function purchaseD1ExamPin(request: Request, env: Env) {
   const pins = collectPins(supplier);
   const status = providerStatus === 'successful' ? 'successful' : 'pending';
   await env.DB.prepare('UPDATE service_transactions SET status=?,provider_status=?,pins_json=?,updated_at=? WHERE user_id=? AND reference=?').bind(status, providerStatus, JSON.stringify(pins), Date.now(), auth.user.uid, reference).run();
-  if (status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
+  if (status === 'successful') await sendEmailNotification(env, 'service_purchase', reference, auth.user.uid);
   return json({ reference, status, product: { id: product.id, provider: product.provider }, quantity, unitPrice: retailPrice, totalAmount: retailPrice * quantity, hasDelivery: status === 'successful' && pins.length > 0, message: pins.length ? 'Exam PINs were delivered by TopupMate.' : 'Your exam order is awaiting confirmation.' }, status === 'successful' ? 200 : 202);
 }
 
@@ -1283,7 +953,7 @@ async function purchaseD1Airtime(request: Request, env: Env) {
   const existing = await env.DB.prepare('SELECT service, provider_id, provider_name, quantity, unit_price_minor, total_amount_minor, status, pins_json FROM service_transactions WHERE user_id=? AND reference=?').bind(auth.user.uid, reference).first<Record<string, unknown>>();
   if (existing) {
     if (existing.service !== 'airtime' || String(existing.provider_id) !== networkId || Number(existing.total_amount_minor) !== amountMinor) return json({ error: { code: 'REFERENCE_CONFLICT', message: 'This order reference belongs to another purchase.' } }, 409);
-    if (existing.status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
+    if (existing.status === 'successful') await sendEmailNotification(env, 'service_purchase', reference, auth.user.uid);
     return json({ reference, status: existing.status === 'successful' ? 'successful' : existing.status, network: { id: networkId, name: String(existing.provider_name) }, amount: amountMinor / 100, message: 'This order reference has already been recorded.' }, existing.status === 'successful' ? 200 : 202);
   }
 
@@ -1311,7 +981,7 @@ async function purchaseD1Airtime(request: Request, env: Env) {
   }
   const status = providerStatus === 'successful' ? 'successful' : 'pending';
   await env.DB.prepare('UPDATE service_transactions SET status=?,provider_status=?,updated_at=? WHERE user_id=? AND reference=?').bind(status, providerStatus, Date.now(), auth.user.uid, reference).run();
-  if (status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
+  if (status === 'successful') await sendEmailNotification(env, 'service_purchase', reference, auth.user.uid);
   return json({ reference, status, network: { id: networkId, name: network.name }, amount, message: status === 'successful' ? 'Airtime delivery was confirmed by the supplier.' : 'Your airtime request is awaiting supplier confirmation.' }, status === 'successful' ? 200 : 202);
 }
 
@@ -1341,7 +1011,7 @@ async function purchaseD1Electricity(request: Request, env: Env) {
   if (existing) {
     if (existing.service !== 'electricity' || String(existing.provider_id) !== providerId || Number(existing.total_amount_minor) !== amountMinor) return json({ error: { code: 'REFERENCE_CONFLICT', message: 'This order reference belongs to another purchase.' } }, 409);
     if (existing.status === 'failed') return json({ error: { code: 'PREVIOUS_ORDER_FAILED', message: 'This order failed and its wallet debit was refunded. Start a new order.' } }, 409);
-    if (existing.status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
+    if (existing.status === 'successful') await sendEmailNotification(env, 'service_purchase', reference, auth.user.uid);
     let delivery: unknown = [];
     try { delivery = existing.pins_json ? JSON.parse(String(existing.pins_json)) : []; } catch { delivery = []; }
     return json({ reference, status: existing.status, provider: { id: providerId, name: String(existing.provider_name) }, amount, hasDelivery: existing.status === 'successful' && Array.isArray(delivery) && delivery.length > 0, message: 'This order reference has already been recorded. Check its status before submitting again.' }, existing.status === 'successful' ? 200 : 202);
@@ -1376,7 +1046,7 @@ async function purchaseD1Electricity(request: Request, env: Env) {
   const status = providerStatus === 'successful' ? 'successful' : 'pending';
   const delivery = collectPins(supplier);
   await env.DB.prepare('UPDATE service_transactions SET status=?,provider_status=?,pins_json=?,updated_at=? WHERE user_id=? AND reference=?').bind(status, providerStatus, JSON.stringify(delivery), Date.now(), auth.user.uid, reference).run();
-  if (status === 'successful') await sendBrevoNotification(env, 'service_purchase', reference, auth.user.uid);
+  if (status === 'successful') await sendEmailNotification(env, 'service_purchase', reference, auth.user.uid);
   return json({ reference, status, provider: { id: providerId, name: provider.name }, amount, hasDelivery: status === 'successful' && delivery.length > 0, message: status === 'successful' ? delivery.length ? 'The electricity payment was confirmed and the token is ready to download.' : 'The electricity payment was confirmed. The token is not available from the supplier response yet.' : 'Your electricity order is awaiting supplier confirmation.' }, status === 'successful' ? 200 : 202);
 }
 
@@ -1504,17 +1174,24 @@ async function submitSupportComplaint(request: Request, env: Env) {
   ].join('\n');
 
   try {
-    await env.SUPPORT_MAILER.send({
-      from: env.SUPPORT_FROM_EMAIL,
-      to: env.SUPPORT_EMAIL,
-      replyTo: email,
-      subject,
-      text,
-    });
+    if (env.RESEND_API_KEY?.trim() && env.RESEND_FROM_EMAIL?.trim()) {
+      const notification = supportComplaintNotification({ customerEmail: email, reference, message });
+      const sent = await sendResendEmail(env, { to: env.SUPPORT_EMAIL, subject, html: notification.html, text: notification.text, replyTo: email, tags: [{ name: 'app', value: 'sameduhub' }, { name: 'audience', value: 'support' }, { name: 'event', value: 'complaint' }] });
+      if (!sent) return json({ error: { code: 'SUPPORT_EMAIL_FAILED', message: 'We could not send your complaint. Please try again later.' } }, 502);
+      const acknowledgement = supportComplaintAcknowledgement({ name: email.split('@')[0], reference });
+      await sendResendEmail(env, { to: email, subject: 'We received your SamEduHub support message', html: acknowledgement.html, text: acknowledgement.text, tags: [{ name: 'app', value: 'sameduhub' }, { name: 'audience', value: 'customer' }, { name: 'event', value: 'support-acknowledgement' }] });
+    } else {
+      await env.SUPPORT_MAILER.send({
+        from: env.SUPPORT_FROM_EMAIL,
+        to: env.SUPPORT_EMAIL,
+        replyTo: email,
+        subject,
+        text,
+      });
+    }
     return json({ ok: true });
   } catch (error) {
-    const code = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : 'unknown';
-    console.error('Cloudflare Email Service rejected a support complaint:', code);
+    console.error('Support complaint email failed:', error instanceof Error ? error.name : 'unknown');
     return json({ error: { code: 'SUPPORT_EMAIL_FAILED', message: 'We could not send your complaint. Please try again later.' } }, 502);
   }
 }
@@ -1542,7 +1219,7 @@ async function cloudflareHealth(env: Env) {
 
 const worker = {
   async scheduled(_controller: { scheduledTime: number; cron: string }, env: Env) {
-    await retryPendingBrevoNotifications(env);
+    await retryPendingEmailNotifications(env);
   },
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -1550,12 +1227,12 @@ const worker = {
       || url.pathname === '/api/cloudflare/transactions'
       || url.pathname.startsWith('/api/cloudflare/transactions/')
       || url.pathname === '/api/cloudflare/sme/transaction-status'
-      || url.pathname.startsWith('/api/cloudflare/paystack/')
+      || url.pathname === '/api/cloudflare/paystack/callback'
+      || url.pathname === '/api/cloudflare/paystack/webhook'
       || url.pathname.startsWith('/api/cloudflare/services/');
     const fundingEnabled = env.CLOUDFLARE_FUNDING_ENABLED === 'true';
     const fundingPath = url.pathname === '/api/cloudflare/wallet/funding'
       || /^\/api\/cloudflare\/wallet\/funding\/[^/]+$/.test(url.pathname)
-      || url.pathname === '/api/cloudflare/paystack/virtual-account'
       || url.pathname === '/api/cloudflare/paystack/callback'
       || url.pathname === '/api/cloudflare/paystack/webhook';
     const previewBalanceRead = url.pathname === '/api/cloudflare/wallet' && request.method === 'GET' && fundingEnabled;
@@ -1586,8 +1263,6 @@ const worker = {
     if (fundingMatch && request.method === 'GET') return getD1Funding(request, env, decodeURIComponent(fundingMatch[1]));
     if (url.pathname === '/api/cloudflare/transactions' && request.method === 'GET') return listD1Transactions(request, env);
     if (url.pathname === '/api/cloudflare/wallet/funding' && request.method === 'POST') return createD1Funding(request, env);
-    if (url.pathname === '/api/cloudflare/paystack/virtual-account' && request.method === 'GET') return getD1VirtualAccount(request, env);
-    if (url.pathname === '/api/cloudflare/paystack/virtual-account' && request.method === 'POST') return createD1VirtualAccount(request, env);
     if (url.pathname === '/api/cloudflare/services/data/purchase' && request.method === 'POST') return purchaseD1Data(request, env);
     const deliveryMatch = url.pathname.match(/^\/api\/cloudflare\/transactions\/([^/]+)\/delivery$/);
     if (deliveryMatch && request.method === 'GET') return getD1TransactionDelivery(request, env, decodeURIComponent(deliveryMatch[1]));
