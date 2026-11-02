@@ -19,6 +19,7 @@ import { auth } from '../firebase';
 import { apiRequest } from '../services/apiClient';
 import { updateProfile } from 'firebase/auth';
 import { describeApiError, getExamPurchaseHistory, getIntegrationHealth, getLiveDataPlans, getLiveElectricityProviders, getLiveExamProducts, getLiveNetworks, getTransactionDelivery, getTransactionStatus, getTransactions, purchaseAirtime, purchaseData, purchaseElectricity, purchaseExamPin, verifyElectricityCustomer, type ExamPurchaseHistoryItem, type TopupmateExamProduct, type TopupmateNetwork, type TopupmatePlan, type TopupmateUtilityProvider } from '../services/smeApi';
+import { submitSupportComplaint } from '../services/support';
 import { createWalletFunding, getWalletBalance, getWalletFundingStatus } from '../services/wallet';
 
 export type DashboardPageId =
@@ -577,16 +578,28 @@ function ProfilePage({ currentUser, onNavigate, onProfileUpdated }: DashboardPag
   return <PageFrame page="profile" onNavigate={onNavigate}><div className="grid gap-5 lg:grid-cols-[1.1fr_.9fr]"><FormCard title="Account details" onSubmit={submit}><div className="grid gap-4"><Field label="Display name"><input value={name} onChange={e => setName(e.target.value)} className={inputClass} /></Field><Field label="Email address" hint="To change your email address, please contact support."><input value={currentUser.email} readOnly className={inputClass} /></Field></div><div className="mt-5"><SubmitButton disabled={saving}>{saving ? 'Saving…' : 'Save changes'}</SubmitButton></div></FormCard><div className="rounded-lg border border-[#d9e5f5] bg-white p-5 shadow-sm"><h2 className="text-lg font-extrabold text-[#0c3275]">Account status</h2><div className="mt-5 space-y-4 text-sm"><div className="flex items-center justify-between border-b border-[#edf2f8] pb-3"><span className="text-[#6c82a4]">Authentication</span><span className="font-bold text-emerald-600">Secure sign-in active</span></div><div className="flex items-center justify-between border-b border-[#edf2f8] pb-3"><span className="text-[#6c82a4]">Email verification</span><span className={`font-bold ${verified ? 'text-emerald-600' : 'text-amber-700'}`}>{verified ? 'Verified' : 'Not verified'}</span></div><div className="flex items-center justify-between"><span className="text-[#6c82a4]">Account email</span><span className="max-w-[190px] truncate font-bold text-[#173b79]">{currentUser.email}</span></div></div></div></div><StatusBanner status={status} /></PageFrame>;
 }
 
-function SupportPage({ onNavigate }: DashboardPageProps) {
+function SupportPage({ currentUser, onNavigate }: DashboardPageProps) {
   const [reference, setReference] = useState('');
   const [message, setMessage] = useState('');
   const [status, setStatus] = useState<Status>(null);
-  const submit = (event: FormEvent<HTMLFormElement>) => {
+  const [submitting, setSubmitting] = useState(false);
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!reference.trim() || !message.trim()) { setStatus({ type: 'error', title: 'Complete the complaint form', message: 'Add a transaction reference and describe the issue before submitting.' }); return; }
-    setStatus({ type: 'info', title: 'Complaint not submitted', message: 'The support/complaints endpoint is not configured in this project. Your message was not sent or stored.' });
+    setSubmitting(true);
+    setStatus(null);
+    try {
+      await submitSupportComplaint({ email: currentUser.email, reference: reference.trim(), message: message.trim() });
+      setReference('');
+      setMessage('');
+      setStatus({ type: 'success', title: 'Complaint submitted', message: 'Your message was sent to support. We’ll reply to your email.' });
+    } catch (error) {
+      setStatus({ type: 'error', title: 'Complaint not submitted', message: error instanceof Error ? error.message : 'We could not send your complaint. Please try again later.' });
+    } finally {
+      setSubmitting(false);
+    }
   };
-  return <PageFrame page="support" onNavigate={onNavigate}><div className="grid gap-5 lg:grid-cols-[.8fr_1.2fr]"><div className="space-y-5"><div className="rounded-lg border border-[#d9e5f5] bg-white p-5 shadow-sm"><h2 className="text-lg font-extrabold text-[#0c3275]">Contact options</h2><div className="mt-5 space-y-3"><a href="mailto:support@sameduhub.com" className="flex items-center gap-3 rounded-lg border border-[#edf2f8] p-3 text-sm font-bold text-[#173b79] transition hover:border-[#9bbcf5] hover:text-[#155EEF]"><Mail className="h-5 w-5 text-[#155EEF]" />support@sameduhub.com<ChevronRight className="ml-auto h-4 w-4" /></a><a href="mailto:support@sameduhub.com?subject=SamEduHub%20support" className="flex items-center gap-3 rounded-lg border border-[#edf2f8] p-3 text-sm font-bold text-[#173b79] transition hover:border-[#9bbcf5] hover:text-[#155EEF]"><Headphones className="h-5 w-5 text-[#155EEF]" />Email customer support<ChevronRight className="ml-auto h-4 w-4" /></a></div></div><IntegrationNotice capability="support tickets and complaint submission" /></div><FormCard title="Submit a complaint" onSubmit={submit}><Field label="Transaction reference" hint="Required so support can locate the relevant transaction after the endpoint is connected."><input value={reference} onChange={e => setReference(e.target.value)} className={inputClass} placeholder="Enter reference" /></Field><div className="mt-4"><Field label="Complaint details"><textarea value={message} onChange={e => setMessage(e.target.value)} className={`${inputClass} min-h-[150px] resize-y`} placeholder="Describe the issue" /></Field></div><div className="mt-5"><SubmitButton>Submit complaint</SubmitButton></div></FormCard></div><StatusBanner status={status} /></PageFrame>;
+  return <PageFrame page="support" onNavigate={onNavigate}><div className="grid gap-5 lg:grid-cols-[.8fr_1.2fr]"><div className="space-y-5"><div className="rounded-lg border border-[#d9e5f5] bg-white p-5 shadow-sm"><h2 className="text-lg font-extrabold text-[#0c3275]">Contact options</h2><div className="mt-5 space-y-3"><a href="mailto:support@sameduhub.com" className="flex items-center gap-3 rounded-lg border border-[#edf2f8] p-3 text-sm font-bold text-[#173b79] transition hover:border-[#9bbcf5] hover:text-[#155EEF]"><Mail className="h-5 w-5 text-[#155EEF]" />support@sameduhub.com<ChevronRight className="ml-auto h-4 w-4" /></a><a href="mailto:support@sameduhub.com?subject=SamEduHub%20support" className="flex items-center gap-3 rounded-lg border border-[#edf2f8] p-3 text-sm font-bold text-[#173b79] transition hover:border-[#9bbcf5] hover:text-[#155EEF]"><Headphones className="h-5 w-5 text-[#155EEF]" />Email customer support<ChevronRight className="ml-auto h-4 w-4" /></a></div></div></div><FormCard title="Submit a complaint" onSubmit={submit}><Field label="Transaction reference" hint="Required so support can locate the relevant transaction."><input value={reference} onChange={e => setReference(e.target.value)} className={inputClass} placeholder="Enter reference" disabled={submitting} /></Field><div className="mt-4"><Field label="Complaint details"><textarea value={message} onChange={e => setMessage(e.target.value)} className={`${inputClass} min-h-[150px] resize-y`} placeholder="Describe the issue" disabled={submitting} /></Field></div><div className="mt-5"><SubmitButton disabled={submitting}>{submitting ? 'Sending…' : 'Submit complaint'}</SubmitButton></div></FormCard></div><StatusBanner status={status} /></PageFrame>;
 }
 
 type AdminOverview = {

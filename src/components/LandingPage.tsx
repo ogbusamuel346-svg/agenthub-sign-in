@@ -12,6 +12,7 @@ import {
   Check,
   FileText,
 } from 'lucide-react';
+import { submitSupportComplaint } from '../services/support';
 
 interface LandingPageProps {
   onSignIn: () => void;
@@ -56,18 +57,12 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     setContactSubmitting(true);
     setContactSubmitNotice(null);
     try {
-      const response = await fetch('/api/cloudflare/support/complaints', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: contactEmail.trim(),
-          reference: contactReference.trim(),
-          message: contactComplaint.trim(),
-          website: contactWebsite,
-        }),
+      await submitSupportComplaint({
+        email: contactEmail.trim(),
+        reference: contactReference.trim(),
+        message: contactComplaint.trim(),
+        website: contactWebsite,
       });
-      const result = await response.json().catch(() => null) as { error?: { message?: string } } | null;
-      if (!response.ok) throw new Error(result?.error?.message || 'We could not send your complaint. Please try again later.');
       setContactSubmitNotice({ type: 'success', message: 'Your complaint has been sent to support. We’ll reply to your email.' });
       setContactReference('');
       setContactComplaint('');
