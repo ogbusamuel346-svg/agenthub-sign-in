@@ -20,19 +20,14 @@
     "CLOUDFLARE_WALLET_CUTOVER": "true",
     "CLOUDFLARE_FUNDING_ENABLED": "true",
     "TOPUPMATE_PURCHASES_ENABLED": "true",
-    "SUPPORT_EMAIL": "support@sameduhub.com",
-    "SUPPORT_FROM_EMAIL": "SamEduHub Support <support@sameduhub.com>",
-    "RESEND_FROM_EMAIL": "SamEduHub <support@sameduhub.com>",
-    "RESEND_ADMIN_EMAIL": "support@sameduhub.com"
+    "SUPPORT_EMAIL": "ogbu8372@gmail.com",
+    "BREVO_SMTP_HOST": "smtp-relay.brevo.com",
+    "BREVO_SMTP_PORT": "587",
+    "BREVO_SMTP_USERNAME": "ogbu8372@gmail.com",
+    "BREVO_FROM_EMAIL": "ogbu8372@gmail.com",
+    "BREVO_FROM_NAME": "SamEduHub",
+    "BREVO_ADMIN_EMAIL": "ogbu8372@gmail.com"
   },
-  "send_email": [
-    {
-      "name": "SUPPORT_MAILER",
-      "destination_address": "support@sameduhub.com",
-      "allowed_sender_addresses": ["support@sameduhub.com"],
-      "remote": true
-    }
-  ],
   "d1_databases": [
     {
       "binding": "DB",

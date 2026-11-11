@@ -3,6 +3,7 @@ import { verifyPaystackTransaction } from '../shared/paystack';
 import { isValidPaystackWebhookSignature, makeWebhookEventKey, validateSuccessfulPaystackTransaction } from '../shared/walletSecurity';
 import { getSupplierTransactionStatus, normalizeDataPlans, normalizeNetworks, normalizeExamProducts, normalizeUtilityProviders } from './catalog';
 import { adminActivityNotification, purchaseConfirmation, supportComplaintAcknowledgement, supportComplaintNotification, walletFundingConfirmation } from './emailTemplates';
+import { sendSmtpEmail, type SmtpConfig } from './smtp';
 
 export interface Env {
   DB: {
@@ -32,19 +33,13 @@ export interface Env {
   CLOUDFLARE_WALLET_CUTOVER?: string;
   CLOUDFLARE_FUNDING_ENABLED?: string;
   SUPPORT_EMAIL?: string;
-  SUPPORT_FROM_EMAIL?: string;
-  RESEND_API_KEY?: string;
-  RESEND_FROM_EMAIL?: string;
-  RESEND_ADMIN_EMAIL?: string;
-  SUPPORT_MAILER: {
-    send(message: {
-      to: string;
-      from: string;
-      subject: string;
-      text: string;
-      replyTo?: string;
-    }): Promise<{ messageId: string }>;
-  };
+  BREVO_SMTP_HOST?: string;
+  BREVO_SMTP_PORT?: string;
+  BREVO_SMTP_USERNAME?: string;
+  BREVO_SMTP_PASSWORD?: string;
+  BREVO_FROM_EMAIL?: string;
+  BREVO_FROM_NAME?: string;
+  BREVO_ADMIN_EMAIL?: string;
 }
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
@@ -126,34 +121,41 @@ async function requireUser(request: Request, env: Env) {
 
 type EmailNotificationKind = 'wallet_funding' | 'service_purchase';
 
-async function sendResendEmail(env: Env, input: { to: string | string[]; subject: string; html: string; text: string; replyTo?: string; tags?: Array<{ name: string; value: string }> }) {
-  const apiKey = env.RESEND_API_KEY?.trim();
-  const from = env.RESEND_FROM_EMAIL?.trim();
-  if (!apiKey || !from) return false;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8_000);
+type TransactionalEmailInput = { to: string | string[]; subject: string; html: string; text: string; replyTo?: string };
+
+function emailProviderConfigured(env: Env) {
+  return Boolean(brevoSmtpConfig(env));
+}
+
+function adminEmailAddress(env: Env) {
+  return env.BREVO_ADMIN_EMAIL?.trim() || '';
+}
+
+function brevoSmtpConfig(env: Env): SmtpConfig | null {
+  const host = env.BREVO_SMTP_HOST?.trim();
+  const username = env.BREVO_SMTP_USERNAME?.trim();
+  const password = env.BREVO_SMTP_PASSWORD?.trim();
+  const fromEmail = env.BREVO_FROM_EMAIL?.trim();
+  const port = Number(env.BREVO_SMTP_PORT || '587');
+  if (!host || !username || !password || !fromEmail || !Number.isInteger(port) || port < 1 || port > 65_535) return null;
+  return { host, port, username, password, fromEmail, fromName: env.BREVO_FROM_NAME?.trim() || 'SamEduHub', ehloName: 'sameduhub.com' };
+}
+
+async function sendTransactionalEmail(env: Env, input: TransactionalEmailInput) {
+  const config = brevoSmtpConfig(env);
+  if (!config) return false;
   try {
-    const response = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ from, to: input.to, subject: input.subject, html: input.html, text: input.text, ...(input.replyTo ? { reply_to: input.replyTo } : {}), tags: input.tags }),
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      console.error('Resend email request failed with status', response.status);
-      return false;
-    }
+    await sendSmtpEmail(config, input);
     return true;
   } catch (error) {
-    console.error('Resend email request failed:', error instanceof Error ? error.name : 'unknown');
+    console.error('Brevo SMTP email request failed:', error instanceof Error ? error.name : 'unknown');
     return false;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
 async function sendAdminNotification(env: Env, kind: EmailNotificationKind, reference: string, userId: string) {
-  if (!env.RESEND_API_KEY?.trim() || !env.RESEND_FROM_EMAIL?.trim() || !env.RESEND_ADMIN_EMAIL?.trim()) return;
+  const recipient = adminEmailAddress(env);
+  if (!emailProviderConfigured(env) || !recipient) return;
   const now = Date.now();
   try {
     await env.DB.prepare("INSERT OR IGNORE INTO admin_email_notifications (event_kind, reference, status, attempts, created_at, updated_at) VALUES (?, ?, 'pending', 0, ?, ?)").bind(kind, reference, now, now).run();
@@ -168,7 +170,7 @@ async function sendAdminNotification(env: Env, kind: EmailNotificationKind, refe
     const provider = funding ? 'Paystack' : String(record.provider_name || 'SamEduHub');
     const name = typeof record.display_name === 'string' && record.display_name.trim() ? record.display_name.trim() : 'Customer';
     const template = adminActivityNotification({ service, provider, amountMinor: Number(record.amount_minor), reference, customerEmail: record.email, customerName: name, kind: funding ? 'wallet funding' : 'product purchase' });
-    const sent = await sendResendEmail(env, { to: env.RESEND_ADMIN_EMAIL.trim(), subject: funding ? `Wallet funded: ${reference}` : `Purchase completed: ${reference}`, html: template.html, text: template.text, tags: [{ name: 'app', value: 'sameduhub' }, { name: 'audience', value: 'admin' }, { name: 'event', value: kind }] });
+    const sent = await sendTransactionalEmail(env, { to: recipient, subject: funding ? `Wallet funded: ${reference}` : `Purchase completed: ${reference}`, html: template.html, text: template.text });
     await env.DB.prepare(sent ? "UPDATE admin_email_notifications SET status='sent', sent_at=?, updated_at=? WHERE event_kind=? AND reference=? AND status='sending'" : "UPDATE admin_email_notifications SET status='pending', updated_at=? WHERE event_kind=? AND reference=? AND status='sending'").bind(...(sent ? [Date.now(), Date.now(), kind, reference] : [Date.now(), kind, reference])).run();
   } catch (error) {
     console.error('Admin email notification failed:', error instanceof Error ? error.name : 'unknown');
@@ -177,7 +179,7 @@ async function sendAdminNotification(env: Env, kind: EmailNotificationKind, refe
 }
 
 async function sendEmailNotification(env: Env, kind: EmailNotificationKind, reference: string, userId: string) {
-  if (!env.RESEND_API_KEY?.trim() || !env.RESEND_FROM_EMAIL?.trim()) return;
+  if (!emailProviderConfigured(env)) return;
   const now = Date.now();
   try {
     await env.DB.prepare("INSERT OR IGNORE INTO email_notifications (event_kind, reference, user_id, status, attempts, created_at, updated_at) VALUES (?, ?, ?, 'pending', 0, ?, ?)").bind(kind, reference, userId, now, now).run();
@@ -197,7 +199,7 @@ async function sendEmailNotification(env: Env, kind: EmailNotificationKind, refe
     const template = funding
       ? walletFundingConfirmation({ name, amountMinor: Number(record.amount_minor), reference })
       : purchaseConfirmation({ name, service, provider, amountMinor: Number(record.amount_minor), reference });
-    const sent = await sendResendEmail(env, { to: record.email, subject: funding ? 'Your SamEduHub wallet has been funded' : `Your ${service} purchase is confirmed`, html: template.html, text: template.text, tags: [{ name: 'app', value: 'sameduhub' }, { name: 'audience', value: 'customer' }, { name: 'event', value: kind }] });
+    const sent = await sendTransactionalEmail(env, { to: record.email, subject: funding ? 'Your SamEduHub wallet has been funded' : `Your ${service} purchase is confirmed`, html: template.html, text: template.text });
     if (!sent) {
       await env.DB.prepare("UPDATE email_notifications SET status='pending', updated_at=? WHERE event_kind=? AND reference=? AND status='sending'").bind(Date.now(), kind, reference).run();
       return;
@@ -211,16 +213,16 @@ async function sendEmailNotification(env: Env, kind: EmailNotificationKind, refe
 }
 
 async function retryPendingEmailNotifications(env: Env) {
-  if (!env.RESEND_API_KEY?.trim() || !env.RESEND_FROM_EMAIL?.trim()) return;
+  if (!emailProviderConfigured(env)) return;
   try {
     const pending = await env.DB.prepare("SELECT event_kind, reference, user_id FROM email_notifications WHERE status='pending' OR (status='sending' AND updated_at<?) ORDER BY created_at LIMIT 50").bind(Date.now() - 300_000).all<{ event_kind: EmailNotificationKind; reference: string; user_id: string }>();
     await Promise.all(pending.results.map(item => sendEmailNotification(env, item.event_kind, item.reference, item.user_id)));
-    if (env.RESEND_ADMIN_EMAIL?.trim()) {
+    if (adminEmailAddress(env)) {
       const adminPending = await env.DB.prepare("SELECT event_kind, reference FROM admin_email_notifications WHERE status='pending' OR (status='sending' AND updated_at<?) ORDER BY created_at LIMIT 50").bind(Date.now() - 300_000).all<{ event_kind: EmailNotificationKind; reference: string }>();
       await Promise.all(adminPending.results.map(item => env.DB.prepare('SELECT user_id FROM email_notifications WHERE event_kind=? AND reference=?').bind(item.event_kind, item.reference).first<{ user_id: string }>().then(row => row ? sendAdminNotification(env, item.event_kind, item.reference, row.user_id) : undefined)));
     }
   } catch {
-    console.error('Resend notification retry batch could not be loaded.');
+    console.error('Transactional email retry batch could not be loaded.');
   }
 }
 
@@ -1144,7 +1146,7 @@ async function submitSupportComplaint(request: Request, env: Env) {
   if (message.length < 10 || message.length > 5_000) {
     return json({ error: { code: 'INVALID_COMPLAINT', message: 'Complaint details must be between 10 and 5,000 characters.' } }, 400);
   }
-  if (!env.SUPPORT_EMAIL || !env.SUPPORT_FROM_EMAIL) {
+  if (!env.SUPPORT_EMAIL || !emailProviderConfigured(env)) {
     return json({ error: { code: 'SUPPORT_EMAIL_NOT_CONFIGURED', message: 'Support email is temporarily unavailable. Please try again later.' } }, 503);
   }
 
@@ -1165,30 +1167,13 @@ async function submitSupportComplaint(request: Request, env: Env) {
   }
 
   const subject = 'SamEduHub support complaint' + (reference ? ' - ' + reference : '');
-  const text = [
-    'Customer email: ' + email,
-    'Transaction reference: ' + (reference || 'Not provided'),
-    '',
-    'Complaint:',
-    message,
-  ].join('\n');
 
   try {
-    if (env.RESEND_API_KEY?.trim() && env.RESEND_FROM_EMAIL?.trim()) {
-      const notification = supportComplaintNotification({ customerEmail: email, reference, message });
-      const sent = await sendResendEmail(env, { to: env.SUPPORT_EMAIL, subject, html: notification.html, text: notification.text, replyTo: email, tags: [{ name: 'app', value: 'sameduhub' }, { name: 'audience', value: 'support' }, { name: 'event', value: 'complaint' }] });
-      if (!sent) return json({ error: { code: 'SUPPORT_EMAIL_FAILED', message: 'We could not send your complaint. Please try again later.' } }, 502);
-      const acknowledgement = supportComplaintAcknowledgement({ name: email.split('@')[0], reference });
-      await sendResendEmail(env, { to: email, subject: 'We received your SamEduHub support message', html: acknowledgement.html, text: acknowledgement.text, tags: [{ name: 'app', value: 'sameduhub' }, { name: 'audience', value: 'customer' }, { name: 'event', value: 'support-acknowledgement' }] });
-    } else {
-      await env.SUPPORT_MAILER.send({
-        from: env.SUPPORT_FROM_EMAIL,
-        to: env.SUPPORT_EMAIL,
-        replyTo: email,
-        subject,
-        text,
-      });
-    }
+    const notification = supportComplaintNotification({ customerEmail: email, reference, message });
+    const sent = await sendTransactionalEmail(env, { to: env.SUPPORT_EMAIL, subject, html: notification.html, text: notification.text, replyTo: email });
+    if (!sent) return json({ error: { code: 'SUPPORT_EMAIL_FAILED', message: 'We could not send your complaint. Please try again later.' } }, 502);
+    const acknowledgement = supportComplaintAcknowledgement({ name: email.split('@')[0], reference });
+    await sendTransactionalEmail(env, { to: email, subject: 'We received your SamEduHub support message', html: acknowledgement.html, text: acknowledgement.text });
     return json({ ok: true });
   } catch (error) {
     console.error('Support complaint email failed:', error instanceof Error ? error.name : 'unknown');

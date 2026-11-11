@@ -37,7 +37,7 @@ Preview wallet funding uses Paystack test credentials (`PAYSTACK_MODE=test`) and
 
 ### Email delivery
 
-Application transaction, admin, and support emails use Resend when configured. Add `RESEND_API_KEY` as a Worker secret, and set `RESEND_FROM_EMAIL` and `RESEND_ADMIN_EMAIL` as Worker variables. The sender domain must be verified in Resend. Email HTML/plain-text templates are in `cloudflare/emailTemplates.ts`; the template inventory and Firebase authentication-email notes are in `docs/email-templates.md`. Firebase currently sends email verification and password-reset action-link emails through its own configured templates.
+Application transaction, admin, and support emails use Brevo SMTP. Add `BREVO_SMTP_PASSWORD` as a Worker secret, and set `BREVO_SMTP_HOST`, `BREVO_SMTP_PORT`, `BREVO_SMTP_USERNAME`, `BREVO_FROM_EMAIL`, `BREVO_FROM_NAME`, and `BREVO_ADMIN_EMAIL` as Worker variables. The Brevo sender must be verified. Email HTML/plain-text templates are in `cloudflare/emailTemplates.ts`; the provider setup, template inventory, and Firebase authentication-email notes are in `docs/email-templates.md`. Firebase continues to send signup verification and password-reset emails through its own configured authentication service.
 
 ### Paystack wallet funding
 

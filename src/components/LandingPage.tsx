@@ -714,7 +714,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 Quick, easy, and reliable mobile credit and digital reloads for you, your family, and friends back home.
               </p>
               <div className="pt-2 text-xs text-slate-400">
-                Support: <span className="text-[#ffbd70]">support@sameduhub.com</span>
+                Support: <span className="text-[#ffbd70]">ogbu8372@gmail.com</span>
               </div>
             </div>
 
