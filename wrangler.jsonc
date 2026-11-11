@@ -23,7 +23,7 @@
     "SUPPORT_EMAIL": "ogbu8372@gmail.com",
     "BREVO_SMTP_HOST": "smtp-relay.brevo.com",
     "BREVO_SMTP_PORT": "587",
-    "BREVO_SMTP_USERNAME": "ogbu8372@gmail.com",
+    "BREVO_SMTP_USERNAME": "c011be001@smtp-brevo.com",
     "BREVO_FROM_EMAIL": "ogbu8372@gmail.com",
     "BREVO_FROM_NAME": "SamEduHub",
     "BREVO_ADMIN_EMAIL": "ogbu8372@gmail.com"

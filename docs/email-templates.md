@@ -26,7 +26,7 @@ Required server configuration:
 ```text
 BREVO_SMTP_HOST=smtp-relay.brevo.com
 BREVO_SMTP_PORT=587
-BREVO_SMTP_USERNAME=ogbu8372@gmail.com
+BREVO_SMTP_USERNAME=c011be001@smtp-brevo.com
 BREVO_SMTP_PASSWORD=your_brevo_smtp_key
 BREVO_FROM_EMAIL=ogbu8372@gmail.com
 BREVO_FROM_NAME=SamEduHub

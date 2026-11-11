@@ -20,7 +20,7 @@ PAYSTACK_FRONTEND_RETURN_URL=""
 SUPPORT_EMAIL="ogbu8372@gmail.com"
 BREVO_SMTP_HOST="smtp-relay.brevo.com"
 BREVO_SMTP_PORT="587"
-BREVO_SMTP_USERNAME="ogbu8372@gmail.com"
+BREVO_SMTP_USERNAME="c011be001@smtp-brevo.com"
 # Use the Brevo SMTP key/password here, not a Brevo API key.
 BREVO_SMTP_PASSWORD="REPLACE_WITH_YOUR_BREVO_SMTP_KEY"
 BREVO_FROM_EMAIL="ogbu8372@gmail.com"
