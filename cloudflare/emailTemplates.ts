@@ -122,6 +122,17 @@ export function signupConfirmationTemplate(actionUrl = '{{ACTION_URL}}') {
   });
 }
 
+export function signupWelcomeNotification(input: { name: string }) {
+  return layout({
+    preheader: 'Your SamEduHub account is verified and ready.',
+    eyebrow: 'Account verified',
+    title: 'Welcome to SamEduHub',
+    intro: `Hello ${input.name}, your email address has been verified successfully. Your SamEduHub account is now ready to use.`,
+    body: '<p style="color:#5F7190;font-size:14px;line-height:1.7;margin:22px 0 0">You can now securely access data, airtime, exam pins, electricity payments and your account wallet from the dashboard.</p>',
+    text: `Hello ${input.name},\n\nYour SamEduHub email address has been verified successfully. Your account is now ready to use.\n\nYou can now access data, airtime, exam pins, electricity payments and your account wallet from the dashboard.`,
+  });
+}
+
 export function passwordResetTemplate(actionUrl = '{{ACTION_URL}}') {
   return layout({
     preheader: 'Reset your SamEduHub password securely.',

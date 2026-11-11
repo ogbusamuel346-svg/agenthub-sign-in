@@ -40,6 +40,7 @@ import {
   browserSessionPersistence,
   signOut,
   onAuthStateChanged,
+  type User,
 } from 'firebase/auth';
 
 interface ToastData {
@@ -48,6 +49,24 @@ interface ToastData {
   title: string;
   message: string;
   position?: 'topRight' | 'center';
+}
+
+type FirebaseProfileSyncResponse = {
+  signupWelcomeSent?: boolean;
+  signupWelcomeQueued?: boolean;
+};
+
+async function refreshAndSyncFirebaseProfile(user: User): Promise<FirebaseProfileSyncResponse> {
+  await user.reload();
+  const token = await user.getIdToken(true);
+  const response = await fetch('/api/cloudflare/profile', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  const payload = await response.json().catch(() => null) as FirebaseProfileSyncResponse & { error?: { message?: string } } | null;
+  if (!response.ok) throw new Error(payload?.error?.message || 'Your account profile could not be synchronized.');
+  return payload || {};
 }
 
 class DashboardErrorBoundary extends React.Component<
@@ -120,26 +139,50 @@ export default function App() {
       setAuthReady(true);
       return;
     }
+    let active = true;
     const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
-      if (firebaseUser) {
-        const firebaseIdToken = firebaseUser.getIdToken();
-        void firebaseIdToken.then((token) => fetch('/api/cloudflare/profile', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({}),
-        })).catch(() => undefined);
-        setCurrentUser({
-          email: firebaseUser.email || '',
-          name: firebaseUser.displayName || (firebaseUser.email ? firebaseUser.email.split('@')[0] : 'Agent Partner'),
-        });
-        setView('dashboard');
-      } else {
+      if (!firebaseUser) {
         setCurrentUser(null);
         setView((previousView) => previousView === 'dashboard' ? 'landing' : previousView);
+        setAuthReady(true);
+        return;
       }
-      setAuthReady(true);
+
+      void (async () => {
+        let profile: FirebaseProfileSyncResponse = {};
+        try {
+          profile = await refreshAndSyncFirebaseProfile(firebaseUser);
+        } catch (error) {
+          console.error('Firebase profile sync failed:', error);
+        }
+        if (!active || auth?.currentUser?.uid !== firebaseUser.uid) return;
+
+        if (!firebaseUser.emailVerified) {
+          setCurrentUser(null);
+          setView((previousView) => previousView === 'dashboard' ? 'signin' : previousView);
+        } else {
+          setCurrentUser({
+            email: firebaseUser.email || '',
+            name: firebaseUser.displayName || (firebaseUser.email ? firebaseUser.email.split('@')[0] : 'Agent Partner'),
+          });
+          setView('dashboard');
+          if (profile.signupWelcomeSent) {
+            setToast({
+              id: Date.now().toString(),
+              type: 'success',
+              title: 'Email Verified',
+              message: 'Your SamEduHub welcome email has been sent.',
+              position: 'topRight',
+            });
+          }
+        }
+        setAuthReady(true);
+      })();
     });
-    return () => unsubscribe();
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, []);
 
   const showNotification = (
@@ -242,16 +285,22 @@ export default function App() {
         await setPersistence(auth, rememberMe ? browserLocalPersistence : browserSessionPersistence);
         const userCredential = await signInWithEmailAndPassword(auth, email, password);
         const user = userCredential.user;
+        try {
+          await refreshAndSyncFirebaseProfile(user);
+        } catch (profileError) {
+          console.error('Firebase profile sync failed after sign-in:', profileError);
+        }
         const displayName = user.displayName || email.split('@')[0];
-        setCurrentUser({ email: user.email || email, name: displayName });
 
         if (!user.emailVerified) {
+          setCurrentUser(null);
           notifyEmailVerification('Verify Your Email');
+          setView('signin');
         } else {
+          setCurrentUser({ email: user.email || email, name: displayName });
           showNotification('success', 'Welcome', 'Login Successfully');
+          setView('dashboard');
         }
-
-        setView('dashboard');
       } catch (err: any) {
         showNotification('error', 'Authentication Failed', getFirebaseErrorMessage(err));
       } finally {

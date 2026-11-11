@@ -16,10 +16,11 @@ The reusable HTML and plain-text templates live in [`cloudflare/emailTemplates.t
 | Successful wallet funding | Customer | `walletFundingConfirmation` |
 | Successful data, airtime, exam PIN, or electricity purchase | Customer | `purchaseConfirmation` |
 | Successful funding or purchase | Admin | `adminActivityNotification` |
+| Email verification completed | Customer | `signupWelcomeNotification` |
 | New support complaint | Support/admin | `supportComplaintNotification` |
 | Support complaint received | Customer | `supportComplaintAcknowledgement` |
 
-The Worker uses Brevo SMTP for all application emails except Firebase authentication emails. It connects to `smtp-relay.brevo.com` on port `587`, upgrades the connection with STARTTLS, authenticates with the Brevo SMTP username and SMTP key/password, and sends the branded HTML/plain-text message. The SMTP password is server-side, and failed transaction/admin notifications are retried through D1. The customer notification table prevents duplicate customer messages; the admin notification table prevents duplicate admin messages.
+The Worker uses Brevo SMTP for application notifications while Firebase continues to send authentication action emails. After Firebase reports a verified email in a fresh ID token, the Worker queues one branded welcome message in `signup_email_notifications`. That queue is keyed by Firebase UID, so the message is sent once and retried by the scheduled Worker if SMTP is temporarily unavailable. Transaction and admin notifications use their existing D1 idempotency tables.
 
 Required server configuration:
 
@@ -54,6 +55,6 @@ The current frontend uses Firebase’s `sendEmailVerification` and `sendPassword
 - `signupConfirmationTemplate(actionUrl)`
 - `passwordResetTemplate(actionUrl)`
 
-Those functions accept a generated action URL. They are not used for signup or password-reset delivery in the current app: Firebase sends those authentication messages. To replace Firebase authentication delivery in the future, the server would need to generate Firebase Admin action links and then call Brevo SMTP; an email credential alone cannot safely generate Firebase verification or password-reset links.
+Those action-link functions are not used for verification or password-reset delivery in the current app: Firebase sends those secure authentication messages. `signupWelcomeNotification` is separate and is sent through Brevo only after the server verifies that Firebase has marked the account email as verified. To replace Firebase authentication delivery in the future, the server would need to generate Firebase Admin action links and then call Brevo SMTP; an email credential alone cannot safely generate Firebase verification or password-reset links.
 
 Do not replace a Firebase action URL with a normal dashboard URL. Verification and password-reset links are one-time security links.

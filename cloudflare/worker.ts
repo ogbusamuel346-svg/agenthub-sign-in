@@ -2,7 +2,7 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { verifyPaystackTransaction } from '../shared/paystack';
 import { isValidPaystackWebhookSignature, makeWebhookEventKey, validateSuccessfulPaystackTransaction } from '../shared/walletSecurity';
 import { getSupplierTransactionStatus, normalizeDataPlans, normalizeNetworks, normalizeExamProducts, normalizeUtilityProviders } from './catalog';
-import { adminActivityNotification, purchaseConfirmation, supportComplaintAcknowledgement, supportComplaintNotification, walletFundingConfirmation } from './emailTemplates';
+import { adminActivityNotification, purchaseConfirmation, signupWelcomeNotification, supportComplaintAcknowledgement, supportComplaintNotification, walletFundingConfirmation } from './emailTemplates';
 import { sendSmtpEmail, type SmtpConfig } from './smtp';
 
 export interface Env {
@@ -105,8 +105,13 @@ async function syncFirebaseProfile(request: Request, env: Env) {
   try {
     const knownEmail = await env.DB.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id <> ?').bind(user.email.toLowerCase(), user.uid).first();
     if (knownEmail) return json({ error: { code: 'PROFILE_EMAIL_CONFLICT', message: 'This email is already mapped to a different account.' } }, 409);
+    const existing = await env.DB.prepare('SELECT email_verified FROM users WHERE id=?').bind(user.uid).first<{ email_verified: number }>();
     await env.DB.prepare("INSERT INTO users (id, email, display_name, email_verified, identity_provider, created_at, updated_at) VALUES (?, ?, ?, ?, 'firebase', ?, ?) ON CONFLICT(id) DO UPDATE SET email = excluded.email, display_name = excluded.display_name, email_verified = excluded.email_verified, updated_at = excluded.updated_at").bind(user.uid, user.email.toLowerCase(), user.name || null, user.emailVerified ? 1 : 0, now, now).run();
-    return json({ ok: true, identityProvider: 'firebase', profileStored: true });
+    const newlyVerified = user.emailVerified && Number(existing?.email_verified || 0) !== 1;
+    const welcome = newlyVerified
+      ? await queueSignupWelcomeEmail(env, { userId: user.uid, email: user.email.toLowerCase(), displayName: user.name || user.email.split('@')[0] })
+      : { sent: false, queued: false };
+    return json({ ok: true, identityProvider: 'firebase', profileStored: true, signupWelcomeSent: welcome.sent, signupWelcomeQueued: welcome.queued });
   } catch {
     return json({ error: { code: 'PROFILE_SYNC_FAILED', message: 'The Cloudflare profile could not be synchronized.' } }, 503);
   }
@@ -151,6 +156,28 @@ async function sendTransactionalEmail(env: Env, input: TransactionalEmailInput) 
     console.error('Brevo SMTP email request failed:', error instanceof Error ? error.message : 'unknown');
     return false;
   }
+}
+
+type SignupWelcomeInput = { userId: string; email: string; displayName: string };
+
+async function queueSignupWelcomeEmail(env: Env, input: SignupWelcomeInput) {
+  const now = Date.now();
+  await env.DB.prepare("INSERT OR IGNORE INTO signup_email_notifications (user_id, email, display_name, status, attempts, created_at, updated_at) VALUES (?, ?, ?, 'pending', 0, ?, ?)").bind(input.userId, input.email, input.displayName, now, now).run();
+  const claimed = await env.DB.prepare("UPDATE signup_email_notifications SET email=?, display_name=?, status='sending', attempts=attempts+1, updated_at=? WHERE user_id=? AND (status='pending' OR (status='sending' AND updated_at<?))").bind(input.email, input.displayName, now, input.userId, now - 300_000).run();
+  if (((claimed as { meta?: { changes?: number } }).meta?.changes || 0) !== 1) return { sent: false, queued: true };
+
+  const template = signupWelcomeNotification({ name: input.displayName });
+  const sent = await sendTransactionalEmail(env, {
+    to: input.email,
+    subject: 'Your SamEduHub account is verified',
+    html: template.html,
+    text: template.text,
+  });
+  await env.DB.prepare(sent
+    ? "UPDATE signup_email_notifications SET status='sent', sent_at=?, updated_at=? WHERE user_id=? AND status='sending'"
+    : "UPDATE signup_email_notifications SET status='pending', updated_at=? WHERE user_id=? AND status='sending'")
+    .bind(...(sent ? [Date.now(), Date.now(), input.userId] : [Date.now(), input.userId])).run();
+  return { sent, queued: true };
 }
 
 async function sendAdminNotification(env: Env, kind: EmailNotificationKind, reference: string, userId: string) {
@@ -215,6 +242,8 @@ async function sendEmailNotification(env: Env, kind: EmailNotificationKind, refe
 async function retryPendingEmailNotifications(env: Env) {
   if (!emailProviderConfigured(env)) return;
   try {
+    const signupPending = await env.DB.prepare("SELECT user_id, email, display_name FROM signup_email_notifications WHERE status='pending' OR (status='sending' AND updated_at<?) ORDER BY created_at LIMIT 50").bind(Date.now() - 300_000).all<SignupWelcomeInput>();
+    await Promise.all(signupPending.results.map(item => queueSignupWelcomeEmail(env, item)));
     const pending = await env.DB.prepare("SELECT event_kind, reference, user_id FROM email_notifications WHERE status='pending' OR (status='sending' AND updated_at<?) ORDER BY created_at LIMIT 50").bind(Date.now() - 300_000).all<{ event_kind: EmailNotificationKind; reference: string; user_id: string }>();
     await Promise.all(pending.results.map(item => sendEmailNotification(env, item.event_kind, item.reference, item.user_id)));
     if (adminEmailAddress(env)) {
