@@ -123,10 +123,11 @@ class SmtpSession {
     if (!expected.includes(code)) throw new Error(`SMTP command failed with status ${code}`);
   }
 
-  upgradeToTls() {
+  async upgradeToTls() {
     this.reader.releaseLock();
     this.writer.releaseLock();
     this.socket = this.socket.startTls();
+    await this.socket.opened;
     this.reader = this.socket.readable.getReader();
     this.writer = this.socket.writable.getWriter();
     this.buffer = '';
@@ -143,24 +144,37 @@ export async function sendSmtpEmail(config: SmtpConfig, message: SmtpMessage) {
   const socket = connect({ hostname: config.host, port: config.port }, { secureTransport: 'starttls', allowHalfOpen: false });
   await socket.opened;
   const session = new SmtpSession(socket);
+  let stage = 'greeting';
   try {
     const greeting = await session.response();
     if (greeting !== 220) throw new Error(`SMTP greeting failed with status ${greeting}`);
+    stage = 'initial EHLO';
     await session.command(`EHLO ${cleanHeader(config.ehloName)}`, [250]);
+    stage = 'STARTTLS';
     await session.command('STARTTLS', [220]);
-    session.upgradeToTls();
+    stage = 'TLS handshake';
+    await session.upgradeToTls();
+    stage = 'secure EHLO';
     await session.command(`EHLO ${cleanHeader(config.ehloName)}`, [250]);
+    stage = 'SMTP authentication';
     await session.command('AUTH LOGIN', [334]);
     await session.command(base64(config.username), [334]);
     await session.command(base64(config.password), [235]);
+    stage = 'sender validation';
     await session.command(`MAIL FROM:<${mailbox(config.fromEmail)}>`, [250]);
+    stage = 'recipient validation';
     const recipients = (Array.isArray(message.to) ? message.to : [message.to]).map(mailbox);
     for (const recipient of recipients) await session.command(`RCPT TO:<${recipient}>`, [250, 251]);
+    stage = 'message delivery';
     await session.command('DATA', [354]);
     await session.write(`${dotStuff(buildMimeMessage(config, message))}\r\n.\r\n`);
     const delivered = await session.response();
     if (delivered !== 250) throw new Error(`SMTP delivery failed with status ${delivered}`);
+    stage = 'connection close';
     await session.command('QUIT', [221]);
+  } catch (error) {
+    const messageText = error instanceof Error ? error.message : 'unknown SMTP error';
+    throw new Error(`${stage}: ${messageText}`);
   } finally {
     await session.close();
   }

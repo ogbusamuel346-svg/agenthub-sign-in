@@ -148,7 +148,7 @@ async function sendTransactionalEmail(env: Env, input: TransactionalEmailInput) 
     await sendSmtpEmail(config, input);
     return true;
   } catch (error) {
-    console.error('Brevo SMTP email request failed:', error instanceof Error ? error.name : 'unknown');
+    console.error('Brevo SMTP email request failed:', error instanceof Error ? error.message : 'unknown');
     return false;
   }
 }
