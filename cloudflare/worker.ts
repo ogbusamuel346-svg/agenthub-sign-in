@@ -292,7 +292,13 @@ async function supportChat(request: Request, env: Env) {
     return json({ reply });
   } catch (error) {
     if (error instanceof GroqServiceError) {
-      console.error('Public support chat Groq request failed.', { status: error.status, retryable: error.retryable });
+      console.error('Public support chat Groq request failed.', {
+        status: error.status,
+        retryable: error.retryable,
+        providerCode: error.providerCode,
+        providerType: error.providerType,
+        providerMessage: error.providerMessage,
+      });
     } else {
       console.error('Public support chat handler failed.', { errorName: error instanceof Error ? error.name : 'unknown' });
     }

@@ -29,6 +29,7 @@
     "BREVO_ADMIN_EMAIL": "ogbu8372@gmail.com",
     "WHATSAPP_AI_ENABLED": "false",
     "WHATSAPP_REQUEST_TIMEOUT_MS": "15000",
+    "GROQ_MODEL": "openai/gpt-oss-120b",
     "GROQ_REQUEST_TIMEOUT_MS": "15000"
   },
   "d1_databases": [

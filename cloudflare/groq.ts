@@ -12,12 +12,18 @@ export type GroqConfig = {
 export class GroqServiceError extends Error {
   status: number;
   retryable: boolean;
+  providerCode?: string;
+  providerType?: string;
+  providerMessage?: string;
 
-  constructor(message: string, status = 502, retryable = false) {
+  constructor(message: string, status = 502, retryable = false, providerError?: { code?: string; type?: string; message?: string }) {
     super(message);
     this.name = 'GroqServiceError';
     this.status = status;
     this.retryable = retryable;
+    this.providerCode = providerError?.code?.slice(0, 120);
+    this.providerType = providerError?.type?.slice(0, 120);
+    this.providerMessage = providerError?.message?.slice(0, 300);
   }
 }
 
@@ -41,10 +47,17 @@ export async function generateGroqResponse(config: GroqConfig, messages: GroqCha
       signal: controller.signal,
     });
     if (!response.ok) {
+      const payload = await response.json().catch(() => null) as { error?: { code?: unknown; type?: unknown; message?: unknown } } | null;
+      const providerError = payload?.error;
       throw new GroqServiceError(
         response.status === 429 ? 'Groq is temporarily rate-limited.' : 'Groq could not generate a response.',
         response.status,
         response.status === 408 || response.status === 429 || response.status >= 500,
+        {
+          code: typeof providerError?.code === 'string' ? providerError.code : undefined,
+          type: typeof providerError?.type === 'string' ? providerError.type : undefined,
+          message: typeof providerError?.message === 'string' ? providerError.message : undefined,
+        },
       );
     }
     const payload = await response.json().catch(() => null) as { choices?: Array<{ message?: { content?: unknown } }> } | null;
