@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { UserDashboard } from './components/UserDashboard';
 import { LandingPage } from './components/LandingPage';
+import { SupportChatWidget } from './components/SupportChatWidget';
 import {
   AuthBrand,
   AuthDivider,
@@ -496,6 +497,7 @@ export default function App() {
     return (
       <>
         {renderToast()}
+        <SupportChatWidget />
         <LandingPage
           onSignIn={() => setView('signin')}
           onSignUp={() => setView('signup')}
@@ -529,6 +531,7 @@ export default function App() {
 
       {/* Toast Notification */}
       {renderToast()}
+      <SupportChatWidget />
 
       {/* Main Content */}
       <div className="flex-1 flex flex-col">

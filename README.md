@@ -39,6 +39,8 @@ Preview wallet funding uses Paystack test credentials (`PAYSTACK_MODE=test`) and
 
 Application transaction, admin, and support emails use Brevo SMTP. Add `BREVO_SMTP_PASSWORD` as a Worker secret, and set `BREVO_SMTP_HOST`, `BREVO_SMTP_PORT`, `BREVO_SMTP_USERNAME`, `BREVO_FROM_EMAIL`, `BREVO_FROM_NAME`, and `BREVO_ADMIN_EMAIL` as Worker variables. The Brevo sender must be verified. Email HTML/plain-text templates are in `cloudflare/emailTemplates.ts`; the provider setup, template inventory, and Firebase authentication-email notes are in `docs/email-templates.md`. Firebase continues to send signup verification and password-reset emails through its own configured authentication service.
 
+The optional AI WhatsApp assistant uses the official Meta WhatsApp Cloud API and Groq from the Cloudflare Worker. It is disabled until configured and enabled deliberately. See `docs/whatsapp-ai-assistant.md` for credentials, webhook setup, D1 migration, admin controls, testing, and deployment.
+
 ### Paystack wallet funding
 
 The wallet uses Paystack Checkout for one-time funding. The secret key stays in the Worker; the browser receives only a checkout URL and the authenticated user’s own funding status. The Worker verifies the callback and signed `charge.success` webhook before crediting the wallet, with duplicate webhook protection. Dedicated Virtual Accounts are not enabled in this project.

@@ -7,7 +7,9 @@ import {
   FileText,
   Headphones,
   Mail,
+  MessageCircle,
   Search,
+  Send,
   ShieldCheck,
   Smartphone,
   TicketCheck,
@@ -623,6 +625,150 @@ type AdminProductPrice = {
   hasOverride: boolean;
 };
 
+type WhatsAppAssistantStatus = {
+  readiness: { whatsappConfigured: boolean; groqConfigured: boolean; aiEnabledByEnvironment: boolean; businessAccountConfigured: boolean };
+  assistantEnabled: boolean;
+  configuration: WhatsAppAssistantConfig;
+  metrics: { totalConversations: number; totalIncomingMessages: number; totalAiResponses: number; conversationsRequiringHuman: number };
+};
+
+type WhatsAppAssistantConfig = {
+  enabled: boolean;
+  assistantName: string;
+  businessDescription: string;
+  services: string[];
+  prices: string[];
+  faqs: string[];
+  operatingHours: string;
+  welcomeMessage: string;
+  systemInstructions: string;
+  escalationInstructions: string;
+};
+
+type WhatsAppConversation = {
+  phone_number: string;
+  contact_name: string | null;
+  mode: 'ai' | 'paused' | 'human';
+  needs_human: number;
+  escalation_reason: string | null;
+  last_message: string | null;
+  updated_at: number;
+};
+
+type WhatsAppMessage = {
+  whatsapp_message_id: string | null;
+  direction: 'inbound' | 'outbound';
+  sender_type: 'customer' | 'ai' | 'human' | 'system';
+  body: string;
+  status: string;
+  created_at: number;
+};
+
+function WhatsAppAssistantPanel() {
+  const [status, setStatus] = useState<WhatsAppAssistantStatus | null>(null);
+  const [conversations, setConversations] = useState<WhatsAppConversation[]>([]);
+  const [selectedPhone, setSelectedPhone] = useState('');
+  const [messages, setMessages] = useState<WhatsAppMessage[]>([]);
+  const [search, setSearch] = useState('');
+  const [draft, setDraft] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [error, setError] = useState('');
+  const [config, setConfig] = useState<WhatsAppAssistantConfig | null>(null);
+  const cardClass = 'rounded-lg border border-[#d9e5f5] bg-white p-5 shadow-sm';
+  const textareaClass = `${inputClass} min-h-[92px] resize-y`;
+
+  const load = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const [statusResult, conversationResult] = await Promise.all([
+        apiRequest<WhatsAppAssistantStatus>('/api/cloudflare/admin/whatsapp/status', undefined, { authenticated: true }),
+        apiRequest<{ conversations: WhatsAppConversation[] }>(`/api/cloudflare/admin/whatsapp/conversations${search.trim() ? `?search=${encodeURIComponent(search.trim())}` : ''}`, undefined, { authenticated: true }),
+      ]);
+      setStatus(statusResult);
+      setConfig(statusResult.configuration);
+      setConversations(conversationResult.conversations || []);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'The WhatsApp assistant could not be loaded.');
+    } finally { setLoading(false); }
+  };
+
+  useEffect(() => { void load(); }, []);
+
+  useEffect(() => {
+    if (!selectedPhone) { setMessages([]); return; }
+    let active = true;
+    void apiRequest<{ messages: WhatsAppMessage[] }>(`/api/cloudflare/admin/whatsapp/conversations/${encodeURIComponent(selectedPhone)}/messages`, undefined, { authenticated: true })
+      .then(result => { if (active) setMessages(result.messages || []); })
+      .catch(reason => { if (active) setError(reason instanceof Error ? reason.message : 'The conversation could not be loaded.'); });
+    return () => { active = false; };
+  }, [selectedPhone]);
+
+  const updateConversation = async (mode: WhatsAppConversation['mode']) => {
+    if (!selectedPhone) return;
+    try {
+      await apiRequest(`/api/cloudflare/admin/whatsapp/conversations/${encodeURIComponent(selectedPhone)}`, { method: 'PATCH', body: JSON.stringify({ mode }) }, { authenticated: true });
+      setNotice(mode === 'ai' ? 'AI responses resumed.' : mode === 'human' ? 'Human takeover is active; AI responses are paused.' : 'AI responses are paused.');
+      await load();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'The conversation mode could not be updated.'); }
+  };
+
+  const sendHumanMessage = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedPhone || !draft.trim()) return;
+    setSaving(true);
+    try {
+      await apiRequest(`/api/cloudflare/admin/whatsapp/conversations/${encodeURIComponent(selectedPhone)}/messages`, { method: 'POST', body: JSON.stringify({ message: draft.trim() }) }, { authenticated: true });
+      setDraft('');
+      setNotice('Human message queued for WhatsApp delivery.');
+      const refreshed = await apiRequest<{ messages: WhatsAppMessage[] }>(`/api/cloudflare/admin/whatsapp/conversations/${encodeURIComponent(selectedPhone)}/messages`, undefined, { authenticated: true });
+      setMessages(refreshed.messages || []);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'The human message could not be sent.'); }
+    finally { setSaving(false); }
+  };
+
+  const saveConfig = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!config) return;
+    setSaving(true); setError(''); setNotice('');
+    try {
+      const result = await apiRequest<{ configuration: WhatsAppAssistantConfig }>('/api/cloudflare/admin/whatsapp/config', { method: 'PUT', body: JSON.stringify(config) }, { authenticated: true });
+      setConfig(result.configuration); setNotice('WhatsApp assistant configuration saved.'); await load();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'The assistant configuration could not be saved.'); }
+    finally { setSaving(false); }
+  };
+
+  const testGroq = async () => {
+    setSaving(true); setError(''); setNotice('Testing Groq…');
+    try { const result = await apiRequest<{ reply: string }>('/api/cloudflare/admin/whatsapp/test-groq', { method: 'POST', body: JSON.stringify({}) }, { authenticated: true }); setNotice(`Groq test passed: ${result.reply}`); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : 'Groq test failed.'); }
+    finally { setSaving(false); }
+  };
+
+  const updateList = (key: 'services' | 'prices' | 'faqs', value: string) => setConfig(current => current ? { ...current, [key]: value.split('\n').map(item => item.trim()).filter(Boolean) } : current);
+  const readiness = status?.readiness;
+  return <div className="space-y-5">
+    <section className={cardClass}>
+      <div className="flex flex-wrap items-start justify-between gap-3"><div><div className="flex items-center gap-2 text-[#155eef]"><MessageCircle className="h-5 w-5" /><span className="text-xs font-extrabold uppercase tracking-[0.14em]">AI WhatsApp Assistant</span></div><h2 className="mt-1 text-xl font-extrabold text-[#0c3275]">WhatsApp support automation</h2><p className="mt-1 text-xs leading-relaxed text-[#6c82a4]">Meta receives the messages, Groq drafts replies, and D1 keeps each customer conversation separate.</p></div><button type="button" onClick={() => void load()} className="rounded-lg border border-[#c9daf3] px-3 py-2 text-xs font-bold text-[#155eef]">Refresh</button></div>
+      {error && <p className="mt-4 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs font-semibold text-rose-800" role="alert">{error}</p>}{notice && <p className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-xs font-semibold text-emerald-800" role="status">{notice}</p>}
+      <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{[
+        ['Assistant', status ? (status.assistantEnabled ? 'Active' : 'Disabled') : '—', status?.assistantEnabled ? 'text-emerald-700' : 'text-amber-700'],
+        ['WhatsApp', readiness?.whatsappConfigured ? 'Configured' : 'Not configured', readiness?.whatsappConfigured ? 'text-emerald-700' : 'text-rose-700'],
+        ['Groq', readiness?.groqConfigured ? 'Configured' : 'Not configured', readiness?.groqConfigured ? 'text-emerald-700' : 'text-rose-700'],
+        ['Human attention', String(status?.metrics.conversationsRequiringHuman ?? '—'), 'text-[#173b79]'],
+      ].map(([label, value, tone]) => <div key={label} className="rounded-lg border border-[#edf2f8] bg-[#f8fbff] p-4"><p className="text-[11px] font-bold text-[#7890b2]">{label}</p><p className={`mt-2 text-lg font-extrabold ${tone}`}>{loading ? '—' : value}</p></div>)}</div>
+      <div className="mt-3 grid gap-3 sm:grid-cols-3"><div className="rounded-lg bg-[#f4f7fb] p-3 text-xs text-[#456694]">Conversations: <strong>{status?.metrics.totalConversations ?? '—'}</strong></div><div className="rounded-lg bg-[#f4f7fb] p-3 text-xs text-[#456694]">Incoming messages: <strong>{status?.metrics.totalIncomingMessages ?? '—'}</strong></div><div className="rounded-lg bg-[#f4f7fb] p-3 text-xs text-[#456694]">AI replies sent: <strong>{status?.metrics.totalAiResponses ?? '—'}</strong></div></div>
+    </section>
+    <div className="grid gap-5 xl:grid-cols-[.9fr_1.1fr]">
+      <section className={`${cardClass} min-w-0`}><div className="flex items-center justify-between gap-3"><h2 className="font-extrabold text-[#0c3275]">Conversations</h2><button type="button" onClick={() => void load()} className="text-xs font-bold text-[#155eef]">Search</button></div><div className="relative mt-3"><Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#7890b2]" /><input value={search} onChange={event => setSearch(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void load(); }} className={`${inputClass} pl-9`} placeholder="Phone or customer name" /></div><div className="mt-4 max-h-[430px] space-y-2 overflow-y-auto">{conversations.length ? conversations.map(item => <button type="button" key={item.phone_number} onClick={() => setSelectedPhone(item.phone_number)} className={`w-full rounded-lg border p-3 text-left ${selectedPhone === item.phone_number ? 'border-[#155eef] bg-[#edf4ff]' : 'border-[#edf2f8] hover:border-[#b8cff2]'}`}><div className="flex items-center justify-between gap-3"><span className="truncate text-xs font-extrabold text-[#173b79]">{item.contact_name || 'Unknown customer'}</span><span className={`text-[10px] font-bold ${item.mode === 'ai' ? 'text-emerald-700' : item.mode === 'human' ? 'text-rose-700' : 'text-amber-700'}`}>{item.mode}</span></div><p className="mt-1 text-[11px] text-[#6c82a4]">{item.phone_number}</p><p className="mt-2 truncate text-[11px] text-[#456694]">{item.last_message || 'No message preview'}</p></button>) : <p className="py-8 text-center text-xs text-[#6c82a4]">No WhatsApp conversations recorded.</p>}</div></section>
+      <section className={`${cardClass} min-w-0`}><div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="font-extrabold text-[#0c3275]">{selectedPhone || 'Select a conversation'}</h2><p className="mt-1 text-[11px] text-[#7890b2]">AI must be explicitly resumed after human takeover.</p></div>{selectedPhone && <div className="flex flex-wrap gap-2"><button type="button" onClick={() => void updateConversation('ai')} className="rounded-lg bg-[#155eef] px-3 py-2 text-[11px] font-bold text-white">Resume AI</button><button type="button" onClick={() => void updateConversation('paused')} className="rounded-lg border border-amber-200 px-3 py-2 text-[11px] font-bold text-amber-800">Pause</button><button type="button" onClick={() => void updateConversation('human')} className="rounded-lg border border-rose-200 px-3 py-2 text-[11px] font-bold text-rose-700">Human takeover</button></div>}</div><div className="mt-4 h-[330px] space-y-3 overflow-y-auto rounded-lg bg-[#f7faff] p-3">{messages.length ? messages.map((item, index) => <div key={`${item.whatsapp_message_id || item.created_at}-${index}`} className={`flex ${item.direction === 'inbound' ? 'justify-start' : 'justify-end'}`}><div className={`max-w-[85%] rounded-lg px-3 py-2 text-xs ${item.direction === 'inbound' ? 'bg-white text-[#173b79]' : item.sender_type === 'human' ? 'bg-[#fff0e3] text-[#7b3c00]' : 'bg-[#155eef] text-white'}`}><p className="whitespace-pre-wrap">{item.body}</p><p className="mt-1 text-[9px] opacity-70">{item.sender_type} · {item.status}</p></div></div>) : <p className="py-24 text-center text-xs text-[#7890b2]">Choose a conversation to view messages.</p>}</div>{selectedPhone && <form onSubmit={sendHumanMessage} className="mt-3 flex gap-2"><textarea value={draft} onChange={event => setDraft(event.target.value)} className={`${inputClass} min-h-[60px]`} placeholder="Send a human reply" /><button type="submit" disabled={saving || !draft.trim()} className="self-end rounded-lg bg-[#ff7a16] p-3 text-white disabled:opacity-50" aria-label="Send human WhatsApp message"><Send className="h-5 w-5" /></button></form>}</section>
+    </div>
+    <section className={cardClass}><div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="font-extrabold text-[#0c3275]">Assistant knowledge and controls</h2><p className="mt-1 text-xs text-[#6c82a4]">Only add verified SamEduHub information. The assistant will not invent missing prices or policies.</p></div><button type="button" onClick={() => void testGroq()} disabled={saving} className="rounded-lg border border-[#c9daf3] px-3 py-2 text-xs font-bold text-[#155eef] disabled:opacity-50">Test Groq</button></div>{config && <form onSubmit={saveConfig} className="mt-5 grid gap-4 lg:grid-cols-2"><Field label="Activate assistant" hint="Requires server credentials and WHATSAPP_AI_ENABLED=true."><label className="flex items-center gap-3 rounded-lg border border-[#d6e1f0] p-3 text-sm text-[#173b79]"><input type="checkbox" checked={config.enabled} onChange={event => setConfig({ ...config, enabled: event.target.checked })} />Allow AI replies for conversations in AI mode</label></Field><Field label="Assistant name"><input value={config.assistantName} onChange={event => setConfig({ ...config, assistantName: event.target.value })} className={inputClass} /></Field><Field label="Business description"><textarea value={config.businessDescription} onChange={event => setConfig({ ...config, businessDescription: event.target.value })} className={textareaClass} /></Field><Field label="Services offered" hint="One verified service per line."><textarea value={config.services.join('\n')} onChange={event => updateList('services', event.target.value)} className={textareaClass} /></Field><Field label="Verified prices" hint="One verified price or price rule per line."><textarea value={config.prices.join('\n')} onChange={event => updateList('prices', event.target.value)} className={textareaClass} /></Field><Field label="Frequently asked questions" hint="One question and verified answer per line."><textarea value={config.faqs.join('\n')} onChange={event => updateList('faqs', event.target.value)} className={textareaClass} /></Field><Field label="Operating hours"><input value={config.operatingHours} onChange={event => setConfig({ ...config, operatingHours: event.target.value })} className={inputClass} /></Field><Field label="Welcome message"><textarea value={config.welcomeMessage} onChange={event => setConfig({ ...config, welcomeMessage: event.target.value })} className={textareaClass} /></Field><Field label="System instructions"><textarea value={config.systemInstructions} onChange={event => setConfig({ ...config, systemInstructions: event.target.value })} className={textareaClass} /></Field><Field label="Human escalation instructions"><textarea value={config.escalationInstructions} onChange={event => setConfig({ ...config, escalationInstructions: event.target.value })} className={textareaClass} /></Field><div className="lg:col-span-2"><button type="submit" disabled={saving} className="rounded-lg bg-[#155eef] px-5 py-3 text-xs font-extrabold text-white disabled:opacity-50">{saving ? 'Saving…' : 'Save assistant settings'}</button></div></form>}</section>
+  </div>;
+}
+
 function AdminPage() {
   const [overview, setOverview] = useState<AdminOverview | null>(null);
   const [loading, setLoading] = useState(true);
@@ -735,6 +881,7 @@ function AdminPage() {
       {productsError && <p className="mt-3 text-xs font-semibold text-rose-700" role="alert">{productsError}</p>}{pricingNotice && <p className="mt-3 text-xs font-semibold text-emerald-700" role="status">{pricingNotice}</p>}
       {productsLoading ? <p className="mt-4 text-sm text-[#6c82a4]">Loading TopupMate products…</p> : products.length ? <div className="mt-4 overflow-x-auto"><table className="w-full min-w-[760px] text-left text-xs"><thead className="border-b border-[#edf2f8] text-[#6c82a4]"><tr><th className="px-3 py-3">Product</th><th className="px-3 py-3">Supplier price</th><th className="px-3 py-3">Customer price (NGN)</th><th className="px-3 py-3">Action</th></tr></thead><tbody>{products.map(product => <tr key={product.key} className="border-b border-[#f1f5fa] last:border-0"><td className="px-3 py-3 font-semibold text-[#173b79]">{product.name}<span className={`ml-2 rounded-full px-2 py-1 text-[9px] font-bold ${product.available ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{product.available ? 'Available' : 'Unavailable'}</span></td><td className="px-3 py-3 text-[#456694]">{product.supplierPriceMinor === null ? 'Not provided' : money(product.supplierPriceMinor)}</td><td className="px-3 py-3"><input aria-label={`Selling price for ${product.name}`} type="number" min="0.01" max="1000000" step="0.01" value={draftPrices[product.key] ?? ''} onChange={event => setDraftPrices(prices => ({ ...prices, [product.key]: event.target.value }))} className="w-36 rounded-lg border border-[#d6e1f0] px-3 py-2 text-sm text-[#173b79] outline-none focus:border-[#155eef]" /></td><td className="px-3 py-3"><div className="flex gap-2"><button type="button" disabled={savingProduct === product.key || !product.available} onClick={() => void saveProductPrice(product)} className="rounded-lg bg-[#155eef] px-3 py-2 font-bold text-white disabled:opacity-50">{savingProduct === product.key ? 'Saving…' : 'Save price'}</button>{product.hasOverride && <button type="button" disabled={savingProduct === product.key} onClick={() => void resetProductPrice(product)} className="rounded-lg border border-[#c9daf3] px-3 py-2 font-bold text-[#155eef] disabled:opacity-50">Use supplier price</button>}</div></td></tr>)}</tbody></table></div> : !productsError ? <p className="mt-4 text-sm text-[#6c82a4]">No products returned by TopupMate.</p> : null}
     </section>
+    <WhatsAppAssistantPanel />
   </div>;
 }
 

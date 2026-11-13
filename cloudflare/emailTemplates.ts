@@ -109,6 +109,17 @@ export function supportComplaintAcknowledgement(input: { name: string; reference
   });
 }
 
+export function whatsappEscalationNotification(input: { phoneNumber: string; contactName: string; reason: string; message: string }) {
+  return layout({
+    preheader: 'A WhatsApp conversation needs human attention.',
+    eyebrow: 'WhatsApp escalation',
+    title: 'Human support requested',
+    intro: 'A SamEduHub WhatsApp conversation has been paused for human review.',
+    body: `<div style="margin-top:24px;border-left:4px solid ${primary};background:#F5F8FD;padding:16px 18px;color:${ink};font-size:14px;line-height:1.7;white-space:pre-wrap">${escapeHtml(input.message)}</div>${detailRows([['Customer phone', input.phoneNumber], ['Customer name', input.contactName || 'Not provided'], ['Reason', input.reason]])}`,
+    text: `SamEduHub WhatsApp escalation\n\nCustomer phone: ${input.phoneNumber}\nCustomer name: ${input.contactName || 'Not provided'}\nReason: ${input.reason}\n\nLatest message:\n${input.message}`,
+  });
+}
+
 export function signupConfirmationTemplate(actionUrl = '{{ACTION_URL}}') {
   return layout({
     preheader: 'Confirm your SamEduHub email address.',

@@ -112,6 +112,12 @@ export function UserDashboard({ currentUser, onLogout, onHome, onNotify, onProfi
   }, []);
 
   useEffect(() => {
+    const openSupport = () => setActivePage('support');
+    window.addEventListener('sameduhub:open-support', openSupport);
+    return () => window.removeEventListener('sameduhub:open-support', openSupport);
+  }, []);
+
+  useEffect(() => {
     if (!adminCheckComplete || isAdmin) return;
     let active = true;
     setWalletLoading(true);

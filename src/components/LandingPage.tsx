@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Smartphone,
   ArrowRight,
@@ -46,6 +46,12 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const [contactWebsite, setContactWebsite] = useState('');
   const [contactSubmitting, setContactSubmitting] = useState(false);
   const [contactSubmitNotice, setContactSubmitNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  useEffect(() => {
+    const openSupport = () => openContactModal();
+    window.addEventListener('sameduhub:open-support', openSupport);
+    return () => window.removeEventListener('sameduhub:open-support', openSupport);
+  }, []);
 
   const openContactModal = () => {
     setContactSubmitNotice(null);

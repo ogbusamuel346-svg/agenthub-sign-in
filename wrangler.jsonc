@@ -26,7 +26,10 @@
     "BREVO_SMTP_USERNAME": "c011be001@smtp-brevo.com",
     "BREVO_FROM_EMAIL": "ogbu8372@gmail.com",
     "BREVO_FROM_NAME": "SamEduHub",
-    "BREVO_ADMIN_EMAIL": "ogbu8372@gmail.com"
+    "BREVO_ADMIN_EMAIL": "ogbu8372@gmail.com",
+    "WHATSAPP_AI_ENABLED": "false",
+    "WHATSAPP_REQUEST_TIMEOUT_MS": "15000",
+    "GROQ_REQUEST_TIMEOUT_MS": "15000"
   },
   "d1_databases": [
     {
