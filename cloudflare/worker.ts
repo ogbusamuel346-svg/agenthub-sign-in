@@ -243,7 +243,13 @@ async function supportChat(request: Request, env: Env) {
   if (origin && origin !== new URL(request.url).origin) return json({ error: { code: 'INVALID_ORIGIN', message: 'Chat request could not be processed.' } }, 403);
   if (Number(request.headers.get('Content-Length') || 0) > 12_000) return json({ error: { code: 'CHAT_TOO_LARGE', message: 'Keep your message under 1,000 characters.' } }, 413);
   const config = groqConfig(env);
-  if (!config) return json({ error: { code: 'CHAT_UNAVAILABLE', message: 'The AI assistant is temporarily unavailable.' } }, 503);
+  if (!config) {
+    console.error('Public support chat is not configured.', {
+      groqApiKeyPresent: Boolean(env.GROQ_API_KEY?.trim()),
+      groqModelPresent: Boolean(env.GROQ_MODEL?.trim()),
+    });
+    return json({ error: { code: 'CHAT_UNAVAILABLE', message: 'The AI assistant is temporarily unavailable.' } }, 503);
+  }
   const body = await request.json().catch(() => null) as { messages?: unknown } | null;
   if (!Array.isArray(body?.messages) || body.messages.length < 1 || body.messages.length > 8) {
     return json({ error: { code: 'INVALID_CHAT', message: 'Send up to 8 recent chat messages.' } }, 400);
@@ -285,6 +291,11 @@ async function supportChat(request: Request, env: Env) {
     const reply = await generateGroqResponse(config, [{ role: 'system', content: prompt }, ...messages], `site-chat:${ipHash}`);
     return json({ reply });
   } catch (error) {
+    if (error instanceof GroqServiceError) {
+      console.error('Public support chat Groq request failed.', { status: error.status, retryable: error.retryable });
+    } else {
+      console.error('Public support chat handler failed.', { errorName: error instanceof Error ? error.name : 'unknown' });
+    }
     return json({ error: { code: error instanceof GroqServiceError ? 'CHAT_UNAVAILABLE' : 'CHAT_UNAVAILABLE', message: 'The AI assistant is temporarily unavailable.' } }, error instanceof GroqServiceError ? error.status : 503);
   }
 }
